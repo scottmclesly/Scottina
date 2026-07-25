@@ -11,8 +11,9 @@ Node-RED / Signal K):
             bit-field offset is worse than no table; nothing is ever
             auto- or batch-approved.
   Installed inventory from the store — enable/disable, remove, view
-            manifest, download (the SD-export path for Wio Terminal
-            Island), and ingest hand-copied files from the inbox (§6).
+            manifest, download (the flat SD-export table for decode-only
+            consumers, plus the Light browse index per §5b), and ingest
+            hand-copied files from the inbox (§6).
   DBC       stub ("coming") — same ingest→validate→store flow later into
             tables/dbc/.
 
@@ -269,14 +270,17 @@ the PGN tab, or drop Canboat-style JSON in the inbox.</p>{% endif %}
     type="submit">{{'Disable' if t.enabled else 'Enable'}}</button></form>
   {% endif %}
   <a class="btn ghost" href="{{url_for('download', name=t.name)}}">JSON</a>
+  <a class="btn ghost" href="{{url_for('light_index', name=t.name)}}">index</a>
   <a class="btn ghost" href="{{url_for('manifest', name=t.name)}}">manifest</a>
   <form method="post" style="display:inline"
     action="{{url_for('remove', name=t.name)}}"
     onsubmit="return confirm('Remove {{t.name}}?')">
    <button class="warn" type="submit">Remove</button></form>
  </td></tr>{% endfor %}</table>
- <p class="dim">Download = the SD-export shape for Wio Terminal Island
- (TABLES.md §5): the same JSON, flat.</p></div>{% endif %}
+ <p class="dim">JSON = the flat SD-export table (TABLES.md §5), read by
+ decode-only consumers. index = Scottina Light's browse-then-decode
+ index (§5b); Light loads a per-PGN detail file only for what you pick.
+ </p></div>{% endif %}
 {% if inbox %}<h2>Inbox (hand-copied files in tables/)</h2>
 <div class="card"><p class="dim">Files dropped by the Files screen's USB
 import or by hand. Inert until ingested here — consumers never read the
@@ -453,6 +457,47 @@ def create_app(activity=None):
         if meta is None:
             abort(404)
         return meta
+
+    @app.get("/tables/<name>/index")
+    def light_index(name):
+        """Scottina Light's browse index for this table (TABLES.md §5b) —
+        the same shared writer the USB push uses, so the two export paths
+        emit byte-identical bytes."""
+        if not store.valid_name(name) \
+                or not os.path.exists(store.table_path(name)):
+            abort(404)
+        from tables import lightindex
+        try:
+            built = lightindex.artifacts_for_table(name)
+        except validate.TableInvalid:
+            abort(404)
+        if built is None:
+            abort(404)
+        index_str, _details = built
+        return app.response_class(
+            index_str, mimetype="application/json",
+            headers={"Content-Disposition": "attachment; "
+                     f'filename="{lightindex.index_filename(name)}"'})
+
+    @app.get("/tables/<name>/detail/<int:pgn>")
+    def light_detail(name, pgn):
+        """One per-PGN detail file (TABLES.md §5c): full §2 field defs."""
+        if not store.valid_name(name):
+            abort(404)
+        from tables import lightindex
+        try:
+            built = lightindex.artifacts_for_table(name)
+        except validate.TableInvalid:
+            abort(404)
+        if built is None:
+            abort(404)
+        _index, details = built
+        fn = lightindex.detail_filename(pgn)
+        if fn not in details:
+            abort(404)
+        return app.response_class(
+            details[fn], mimetype="application/json",
+            headers={"Content-Disposition": f'attachment; filename="{fn}"'})
 
     @app.post("/inbox/ingest")
     def ingest():

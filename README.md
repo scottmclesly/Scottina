@@ -63,6 +63,11 @@ interface — no guessing which port Node-RED or Kismet landed on today.
 > The Python package, install path (`/opt/kilodash`), and systemd unit keep the
 > historical working name `kilodash` on purpose — renaming them buys nothing
 > and risks breaking the service. Everything you *see* says Scottina.
+>
+> The established names are **Scottina** / **Scottina Prime** (the panel),
+> **Scottina Light** (the small companion — earlier working name *Island*),
+> **CanTick** (the CAN-over-WiFi box), and **kilodash** (the internal
+> package). Nothing else — don't invent new variants.
 
 ## Why it works the way it does
 
@@ -177,7 +182,7 @@ plugged in** (hotplug, see `devices.py`) and carry a small green "live" badge.
 | **Serial** | FTDI / CP210x / CH340 | Lists USB-serial ports and gives a read-only live view of one at a chosen baud — handy for sniffing UART/debug output. User guide: [docs/I2C-SERIAL.md](docs/I2C-SERIAL.md#serial). |
 | **Logic** | FX2LP (CY7C68013A) | Passive multi-channel digital capture + protocol decode (UART/I2C/SPI/CAN) via the packaged `sigrok-cli`/fx2lafw stack: 8 channels, up to 24 MHz, edge trigger, decoded annotations + per-channel activity strips. Every capture persists to `/opt/kilodash/captures/*.sr` for PulseView on a laptop. Install with [`setup/install-logic-analyzer.sh`](setup/install-logic-analyzer.sh); full user guide: [docs/LOGICANALISER.md](docs/LOGICANALISER.md). **3.3 V logic only** — the bare board has no input protection; series resistor / buffer / divider before probing anything near Scottina's 12 V wiring. |
 | **Tables** | — | **Table converter service + inventory.** Always-visible remote control for the on-device converter web app (start/stop, URL **+ QR code** at the eth0-preferred address) and a mirror of the installed PGN tables (enable/disable = atomic manifest flip, remove). Conversion itself happens in a browser on a big screen: upload a vendor PDF → side-by-side review → human approval → validation → store. Contract: [TABLES.md](TABLES.md); guide: [docs/NMEA2K.md](docs/NMEA2K.md). Install with [`setup/install-tables.sh`](setup/install-tables.sh). |
-| **Files** | USB stick | **Offload logs without a laptop:** plug in any USB stick and copy captures (`candump` logs, `.sr`, IQ, sniffs) from `/opt/kilodash/captures/` onto it — one per tap or all at once — with a sync-then-**Eject** button so it's always safe to pull. Also exchanges **CAN decode tables** (DBC, NMEA2000/canboat) between the stick and `/opt/kilodash/tables/`, where decoding tools read them. Copies never delete the originals. Full user guide: [docs/FILES.md](docs/FILES.md). |
+| **Files** | USB stick | **Offload logs without a laptop:** plug in any USB stick and copy captures (`candump` logs, `.sr`, IQ, sniffs) from `/opt/kilodash/captures/` onto it — one per tap or all at once — with a sync-then-**Eject** button so it's always safe to pull. Also exchanges **CAN decode tables** (DBC, NMEA2000/canboat) between the stick and `/opt/kilodash/tables/`, where decoding tools read them — the *Tables → USB* push also emits **Scottina Light's browse index** ([TABLES.md](TABLES.md) §5b/§5c) alongside the flat tables, feeding Light's CAN gauge picker, not only Prime's own decode. Copies never delete the originals. Full user guide: [docs/FILES.md](docs/FILES.md). |
 | **Light Dock** | Scottina Light (USB) | **Auto-sync on dock:** clock push (with an honest quality label — `ntp` only while NTP is actually synchronized), decode-table push (**Prime always wins**, atomic verify-then-commit), and black-box **log pull** into `captures/light-*` — checksum-verified, deleted from Light only after proof of receipt. Two-distance screen: an across-the-room animation (pulses = syncing, the hug = done, sad face + broken cable = come look) over a session-only log of exactly what landed. Wire contract: `DOCK-PROTOCOL.md`, mirrored verbatim in [Scottina-Light](https://github.com/scottmclesly/Scottina-Light). Full user guide: [docs/LIGHTDOCK.md](docs/LIGHTDOCK.md). |
 
 **Web-app launch terminals** (see below): **Kismet**, **Node-RED**, **AIS**,

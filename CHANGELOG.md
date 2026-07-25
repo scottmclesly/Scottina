@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Scottina Light table index** (`TABLES.md` §5b/§5c) — a browse-then-decode
+  export alongside the existing flat decode-only tables, so Light's CAN gauge
+  can present a PGN picker on a 192 KB device before decoding:
+  - a compact **index** (`<name>.index.json`: abbreviated keys, names + rate
+    budget only) and **per-PGN detail** files (`pgn-<num>.json`: full §2
+    field definitions, loaded one at a time). Fast-packet and PDU1 PGNs are
+    excluded at export time and rejected again on read (two gates).
+  - one **shared writer** (`tables/lightindex.py`) called from both export
+    paths — the web *Installed → index* download and the Files *Tables → USB*
+    push — so they emit byte-identical artifacts; derived from the store on
+    every export, `sha256`-bound to the source table, never hand-maintained.
+  - `TABLES.md` §2 gains an optional `interval_ms` (Canboat
+    `TransmissionInterval`); `tables/validate.py` range-checks it and
+    validates the index shape (`validate_index` / `check_pair`).
 - **GPS integration** (contract in `GPS.md`; Adafruit Ultimate GPS PA1616S
   on the PL2303 dongle udev-pinned to USB port 1-1 → `/dev/gps0` — the
   dongle has no serial number, so the physical port IS the identity):
@@ -111,7 +125,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     `tables/store.py`) — Canboat-JSON subset, per-table manifest sidecar
     (sha256, enabled flag, pgn_count), consumers-read/converter-writes
     discipline, shared validator run on ingest *and* on load, flat
-    SD-export shape feeding Wio Terminal Island.
+    SD-export shape feeding Scottina Light.
   - **Tables converter web app** (`kilodash/tableconv.py`, Flask, port
     8735) — PDF → side-by-side human review → validate → atomic install;
     Installed tab (enable/disable/remove/download/manifest + inbox
@@ -126,7 +140,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
     flip, ✕ = remove). `kilodash/net.py::advertise_addr()` (eth0-preferred)
     is the shared address helper the CanTick work reuses.
   - Files screen **Tables → USB** now exports the installed `pgn/` store
-    (tables + manifests) flat — the Wio Terminal Island SD shape.
+    (tables + manifests) flat — the Scottina Light SD shape.
   - Installer `setup/install-tables.sh`; user guide `docs/NMEA2K.md`.
 
 - **CanTick WiFi-CAN bridge** (`kilodash/cantick.py`, contract in

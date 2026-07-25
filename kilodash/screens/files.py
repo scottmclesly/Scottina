@@ -153,8 +153,13 @@ def _import_tables():
 def _export_tables():
     """Background worker: push /opt/kilodash/tables onto the stick — the
     flat SD-export shape of TABLES.md §5, so one conversion effort feeds
-    Wio Terminal Island too: loose root files AND the converter-installed
-    pgn/ store (tables + manifests), all into one flat dir."""
+    Scottina Light too: loose root files AND the converter-installed
+    pgn/ store (tables + manifests), all into one flat dir.
+
+    Alongside the flat tables, emit Light's browse-then-decode artifacts
+    (TABLES.md §5b/§5c) — the index + per-PGN detail files — from the same
+    shared writer the web download uses, so the two export paths agree byte
+    for byte. These are derived from the store, never the loose copies."""
     dest = os.path.join(MOUNT, DEST_SUB, "tables")
     os.makedirs(dest, exist_ok=True)
     n = 0
@@ -173,9 +178,32 @@ def _export_tables():
                 continue
             shutil.copy2(src, os.path.join(dest, name))
             n += 1
+    idx = _export_light_index(dest)
     _sh("sync", timeout=60)
-    return n, (f"Exported {n} table{'s' if n != 1 else ''} → USB" if n
-               else "tables/ is empty — import first")
+    if not n:
+        return 0, "tables/ is empty — import first"
+    msg = f"Exported {n} table{'s' if n != 1 else ''} → USB"
+    if idx:
+        msg += f" (+{idx} Light index)"
+    return n, msg
+
+
+def _export_light_index(dest):
+    """Emit Light's index + per-PGN detail (TABLES.md §5b/§5c) for every
+    verified store table into the flat export dir. Sorted by table name so
+    two runs from the same store produce byte-identical output. Returns the
+    count of indexed tables."""
+    from tables import store, validate, lightindex
+    n = 0
+    for t in sorted(store.list_tables(), key=lambda t: t["name"]):
+        if not t["verified"]:
+            continue
+        try:
+            if lightindex.write_table_artifacts(dest, t["name"]):
+                n += 1
+        except validate.TableInvalid:
+            continue          # a table that no longer validates isn't indexed
+    return n
 
 
 class FilesScreen(Screen):

@@ -8,7 +8,7 @@ store (consumers only read). Pipeline per the split TODO:
 
 **Fast-packet reassembly lives here**, before decode, because Canboat-style
 JSON describes *assembled* payloads: sequence/frame counters, per-(PGN,
-source) state, out-of-order drops. Wio Terminal Island's reassembly wasn't
+source) state, out-of-order drops. Scottina Light's reassembly wasn't
 extractable into Python, so this is a fresh implementation of the N2K
 fast-packet framing, unit-tested in tests/test_n2k.py — bench-validate
 against captured multi-frame PGNs before trusting it on real traffic

@@ -1,5 +1,5 @@
 """NMEA2000 fast-packet TX framing — first outbound fast-packet in the
-ecosystem (129029 GNSS Position Data needs it; Wio Terminal Island will
+ecosystem (129029 GNSS Position Data needs it; Scottina Light will
 want this again, so it is a standalone, socket-free module).
 
 The framing mirrors what kilodash/n2k.py::FastPacketAssembler reassembles:
