@@ -253,6 +253,19 @@ class TablesScreen(Screen):
                    font=T.font(13, bold=True, mono=True),
                    fill=th.accent if state == webapp.UP else th.muted)
             self._draw_qr(d, th, x0, x1, y0 + 46, y1 - (y0 + 46) - 6, url)
+        elif state == webapp.ERROR and not self.web.installed():
+            # installed-but-failed is the only real fault; if the unit is
+            # absent, never point at a journal that cannot exist — name the
+            # remedy instead (mirrors the launch()-side guard, TABLES.md §4).
+            d.text((x0 + 10, y0 + 32), spaced("CONVERTER NOT INSTALLED"),
+                   font=T.font(11, bold=True, mono=True), fill=th.warn)
+            f = T.font(T.SUB, mono=True)
+            for i, line in enumerate((
+                    "The tables converter service is",
+                    "not on this box yet. Install it:")):
+                d.text((x0 + 10, y0 + 56 + i * 15), line, font=f, fill=th.fg)
+            d.text((x0 + 10, y1 - 24), "sudo setup/install-tables.sh",
+                   font=T.font(T.SUB, mono=True), fill=th.warn)
         elif state == webapp.ERROR:
             d.text((x0 + 10, y0 + 32), spaced("CHECK SYSTEMD LOG"),
                    font=T.font(11, bold=True, mono=True), fill=th.bad)
@@ -276,7 +289,7 @@ class TablesScreen(Screen):
                 d.text(((w - tw) / 2, y0 + 66 + i * 15), line, font=fp,
                        fill=th.muted)
             if not self.web.installed():
-                m = "unit missing — run setup/install-tables.sh"
+                m = "not installed — sudo setup/install-tables.sh"
                 fw = T.font(T.SUB, mono=True)
                 tw = d.textlength(m, font=fw)
                 d.text(((w - tw) / 2, y1 - 22), m, font=fw, fill=th.warn)
