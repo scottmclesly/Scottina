@@ -1,0 +1,30 @@
+{
+  "_synthetic": "SYNTHETIC FIXTURE — not a real PGN table",
+  "_note": "Plumbing fixture — invented ids/offsets, DP3 reserved, not usable on a real bus. Regenerate via generate.py.",
+  "PGNs": [
+    {
+      "PGN": 258050,
+      "Name": "SYN Charlie OVERLAP VARIANT",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Overlap Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Overlap Sig 1",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-V"
+        }
+      ],
+      "TransmissionInterval": 2000
+    }
+  ]
+}
