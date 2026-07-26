@@ -10,10 +10,13 @@ TableInvalid; a malformed *entry* is skipped with a warning while the rest
 of the file loads. Unknown keys are ignored, never fatal.
 """
 
+import hashlib
 import json
 
 NAME_MAX = 64
 FIELD_BITS_MAX = 64
+SINGLE_FRAME_BITS = 64          # one CAN frame = 8 bytes; a non-fast PGN's
+                                # fields must fit inside it (payload-fit §2)
 INDEX_VERSION = 1
 # N2K periodic PGNs top out around 10 s; slower-than-this is effectively
 # "on request", which the picker treats as unknown rather than a rate.
@@ -97,11 +100,18 @@ def _norm_field(fld):
         raise ValueError(f"field {name!r}: negative BitOffset")
     if not 1 <= bit_length <= FIELD_BITS_MAX:
         raise ValueError(f"field {name!r}: BitLength out of 1..{FIELD_BITS_MAX}")
+    res_raw = fld.get("Resolution", 1)
+    if res_raw is None:                  # absent/None ⇒ identity scale
+        res_raw = 1
     try:
-        resolution = float(fld.get("Resolution", 1) or 1)
+        resolution = float(res_raw)
         eng_offset = float(fld.get("Offset", 0) or 0)
     except (TypeError, ValueError):
         raise ValueError(f"field {name!r}: Resolution/Offset not numeric")
+    if resolution == 0:
+        # was silently coerced to 1 (`x or 1`); a real-table typo would then
+        # decode as raw counts and look entirely plausible — reject it.
+        raise ValueError(f"field {name!r}: Resolution 0 is not a valid scale")
     units = fld.get("Units", "")
     return {
         "name": name.strip(),
@@ -150,12 +160,24 @@ def validate(obj):
         if not isinstance(raw_fields, list):
             warnings.append(f"PGN {pgn}: Fields is not a list — skipped")
             continue
+        fast = _fast_packet(entry)
         fields = []
         for fld in raw_fields:
             try:
-                fields.append(_norm_field(fld))
+                nf = _norm_field(fld)
             except ValueError as e:
                 warnings.append(f"PGN {pgn}: {e} — field skipped")
+                continue
+            end = nf["bit_offset"] + nf["bit_length"]
+            if not fast and end > SINGLE_FRAME_BITS:
+                # a single-frame PGN is one 8-byte CAN frame; a field past
+                # bit 64 can never carry data (mislabelled fast-packet or a
+                # broken table). Fast-packet PGNs assemble a larger payload.
+                warnings.append(
+                    f"PGN {pgn}: field {nf['name']!r} ends at bit {end} > "
+                    f"{SINGLE_FRAME_BITS} of a single-frame PGN — skipped")
+                continue
+            fields.append(nf)
         if not fields:
             warnings.append(f"PGN {pgn}: no usable fields — skipped")
             continue
@@ -165,7 +187,7 @@ def validate(obj):
         if pgn in tables:
             warnings.append(f"PGN {pgn}: duplicate entry — later one wins")
         tables[pgn] = {"pgn": pgn, "name": str(name)[:80],
-                       "fast": _fast_packet(entry), "interval_ms": interval_ms,
+                       "fast": fast, "interval_ms": interval_ms,
                        "fields": fields}
     if not tables:
         raise TableInvalid("no valid PGN entries"
@@ -263,3 +285,25 @@ def check_pair(index, details):
             f"index/detail PGN sets disagree: "
             f"index-only={sorted(idx_pgns - det_pgns)}, "
             f"detail-only={sorted(det_pgns - idx_pgns)}")
+
+
+def detail_sha_ok(index, pgn, detail_bytes):
+    """Detection gate for the §5b per-detail sha256: True iff the index's
+    recorded `sha` for `pgn` matches sha256(detail_bytes). A consumer that
+    loads `<src>.pgn-<num>.json` hashes its bytes and refuses to decode when
+    this returns False — prevention (namespacing) plus detection, the
+    standing two-gate rule. An index entry with no `sha` asserts nothing
+    (True); an unknown pgn is False."""
+    if isinstance(detail_bytes, str):
+        detail_bytes = detail_bytes.encode()
+    for e in index.get("pgns", []):
+        try:
+            if int(e["pgn"]) != int(pgn):
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        want = e.get("sha")
+        if not want:
+            return True
+        return hashlib.sha256(detail_bytes).hexdigest() == want
+    return False

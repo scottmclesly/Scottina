@@ -26,6 +26,7 @@ hardware filters. The validator rejects them again on read: two gates, per
 the standing rule (TABLES.md §6).
 """
 
+import hashlib
 import json
 import os
 
@@ -38,8 +39,12 @@ def index_filename(src):
     return src + ".index.json"
 
 
-def detail_filename(pgn):
-    return f"pgn-{int(pgn)}.json"
+def detail_filename(src, pgn):
+    """Namespaced per §5c: `<src>.pgn-<num>.json`. Store names carry no dots
+    ([a-z0-9_-]), so two stores that both define a PGN never collide in one
+    flat export dir, and a decode-only reader tells a table (`<name>.json`,
+    one dot) from a detail (two dots) by name alone."""
+    return f"{src}.pgn-{int(pgn)}.json"
 
 
 def eligible(entry):
@@ -71,12 +76,15 @@ def build_detail(entry):
     return d
 
 
-def _index_entry(entry):
-    """One index row — names only, abbreviated keys. `ms` and per-signal `u`
-    are omitted when unknown/empty to hold the ~120 B/PGN budget."""
+def _index_entry(entry, detail_sha=None):
+    """One index row — names only, abbreviated keys. `ms`, per-signal `u`, and
+    `sha` are omitted when unknown/empty. `sha` is the sha256 of this PGN's
+    detail file (§5b), the per-detail integrity binding the consumer checks."""
     e = {"pgn": entry["pgn"], "n": entry["name"]}
     if entry.get("interval_ms") is not None:
         e["ms"] = entry["interval_ms"]
+    if detail_sha:
+        e["sha"] = detail_sha
     sig = []
     for i, f in enumerate(entry["fields"]):
         s = {"i": i, "n": f["name"]}
@@ -87,11 +95,18 @@ def _index_entry(entry):
     return e
 
 
-def build_index(src, sha256, generated, entries):
-    """entries: eligible normalized PGN entries, PGN-sorted by the caller."""
-    return {"v": INDEX_VERSION, "src": src, "sha256": sha256,
-            "generated": generated,
-            "pgns": [_index_entry(e) for e in entries]}
+def build_index(src, sha256, generated, entries, detail_sha=None, warn=None):
+    """entries: eligible normalized PGN entries, PGN-sorted by the caller.
+    detail_sha: {pgn: hexdigest} for the §5b per-detail binding. warn: the
+    §5b provenance banner a consumer renders persistently."""
+    detail_sha = detail_sha or {}
+    header = {"v": INDEX_VERSION, "src": src, "sha256": sha256,
+              "generated": generated}
+    if warn:
+        header["warn"] = warn
+    header["pgns"] = [_index_entry(e, detail_sha.get(e["pgn"]))
+                      for e in entries]
+    return header
 
 
 def artifacts_for_table(name):
@@ -113,12 +128,35 @@ def artifacts_for_table(name):
     tables, _warns = validate.validate_file(path)
     entries = [tables[p] for p in sorted(tables) if eligible(tables[p])]
     details_by_pgn = {e["pgn"]: build_detail(e) for e in entries}
-    index = build_index(name, sha, meta["converted"], entries)
+    # serialize each detail once, then bind its sha256 into the index (§5b):
+    # a consumer hashes the file it loads and refuses a mismatched pair.
+    detail_str = {p: dumps(d) for p, d in details_by_pgn.items()}
+    detail_sha = {p: hashlib.sha256(s.encode()).hexdigest()
+                  for p, s in detail_str.items()}
+    index = build_index(name, sha, meta["converted"], entries,
+                        detail_sha=detail_sha, warn=_warn_for(path, meta))
     # two-gate (§6): the writer just excluded fast/PDU1; the validator, which
     # does not trust the writer, restates it before anything is emitted.
     validate.check_pair(index, details_by_pgn)
     return (dumps(index),
-            {detail_filename(p): dumps(d) for p, d in details_by_pgn.items()})
+            {detail_filename(name, p): s for p, s in detail_str.items()})
+
+
+def _warn_for(path, meta):
+    """The §5b provenance banner: an explicit `_synthetic` flag carried in the
+    table file if present, else the manifest's `source_doc`. Consumers render
+    it persistently — a synthetic fixture can never masquerade as a real
+    reading. Provenance lives in the manifest / index header, never in the §2
+    table schema (tables travel with manifests)."""
+    try:
+        with open(path) as f:
+            flag = json.load(f).get("_synthetic")
+        if isinstance(flag, str) and flag.strip():
+            return flag.strip()
+    except (OSError, ValueError):
+        pass
+    sd = meta.get("source_doc")
+    return sd.strip() if isinstance(sd, str) and sd.strip() else None
 
 
 def _write_atomic(path, text):

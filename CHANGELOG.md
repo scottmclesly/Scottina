@@ -13,9 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   export alongside the existing flat decode-only tables, so Light's CAN gauge
   can present a PGN picker on a 192 KB device before decoding:
   - a compact **index** (`<name>.index.json`: abbreviated keys, names + rate
-    budget only) and **per-PGN detail** files (`pgn-<num>.json`: full §2
-    field definitions, loaded one at a time). Fast-packet and PDU1 PGNs are
-    excluded at export time and rejected again on read (two gates).
+    budget only) and **per-PGN detail** files (`<src>.pgn-<num>.json`: full
+    §2 field definitions, loaded one at a time). Fast-packet and PDU1 PGNs
+    are excluded at export time and rejected again on read (two gates).
+  - detail files are **namespaced by store** (`<src>.pgn-<num>.json`), so two
+    stores that define the same PGN export side by side with no overwrite —
+    overlap is the normal case (Canboat's table overlaps every vendor one),
+    not an error. Each index entry carries the **sha256 of its detail file**
+    (`validate.detail_sha_ok`) so a consumer refuses a mismatched pair:
+    prevention plus detection.
+  - the index header gains an optional **`warn`** provenance banner, filled
+    from the manifest `source_doc` (or an explicit `_synthetic` flag), which
+    consumers render persistently — a synthetic table cannot masquerade as a
+    real reading. Provenance stays out of the §2 table schema.
   - one **shared writer** (`tables/lightindex.py`) called from both export
     paths — the web *Installed → index* download and the Files *Tables → USB*
     push — so they emit byte-identical artifacts; derived from the store on
@@ -23,6 +33,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `TABLES.md` §2 gains an optional `interval_ms` (Canboat
     `TransmissionInterval`); `tables/validate.py` range-checks it and
     validates the index shape (`validate_index` / `check_pair`).
+
+### Fixed
+
+- **`tables/validate.py` — two confident-wrong-reading holes closed.**
+  `Resolution: 0` was silently coerced to `1` (`float(x or 1)`); a real-table
+  typo would then decode as raw counts and look plausible — it is now a
+  validation error. And a single-frame (non-fast) PGN whose fields extend
+  past bit 64 (one 8-byte CAN frame) is now rejected field-by-field; the
+  check lives in the shared validator so it guards Prime's live decode and
+  the Light export alike. No code relied on the old `0 → 1` coercion.
 - **GPS integration** (contract in `GPS.md`; Adafruit Ultimate GPS PA1616S
   on the PL2303 dongle udev-pinned to USB port 1-1 → `/dev/gps0` — the
   dongle has no serial number, so the physical port IS the identity):

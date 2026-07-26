@@ -62,7 +62,7 @@ class TestExclusion(LightCase):
         index = json.loads(index_str)
         self.assertEqual([e["pgn"] for e in index["pgns"]], [130306])
         # fast-packet (129029) and PDU1 (126720) never reach the index...
-        self.assertEqual(set(details), {"pgn-130306.json"})
+        self.assertEqual(set(details), {"wind.pgn-130306.json"})
         # ...and the index/detail PGN sets agree
         self.assertEqual({e["pgn"] for e in index["pgns"]},
                          {json.loads(d)["pgn"] for d in details.values()})
@@ -189,18 +189,18 @@ class TestBothPathsByteIdentical(LightCase):
         dest = os.path.join(mount, files.DEST_SUB, "tables")
         with open(os.path.join(dest, "wind.index.json")) as f:
             index_d = f.read()
-        with open(os.path.join(dest, "pgn-130306.json")) as f:
+        with open(os.path.join(dest, "wind.pgn-130306.json")) as f:
             detail_d = f.read()
 
         self.assertEqual(index_a, index_b)
         self.assertEqual(index_a, index_c)
         self.assertEqual(index_a, index_d)
-        self.assertEqual(details_a["pgn-130306.json"], detail_c)
-        self.assertEqual(details_a["pgn-130306.json"], detail_d)
+        self.assertEqual(details_a["wind.pgn-130306.json"], detail_c)
+        self.assertEqual(details_a["wind.pgn-130306.json"], detail_d)
         self.assertIn("Light index", msg)
         # ineligible PGNs are not silently offered anywhere
-        self.assertFalse(os.path.exists(os.path.join(dest, "pgn-129029.json")))
-        self.assertFalse(os.path.exists(os.path.join(dest, "pgn-126720.json")))
+        for excluded in ("wind.pgn-129029.json", "wind.pgn-126720.json"):
+            self.assertFalse(os.path.exists(os.path.join(dest, excluded)))
 
 
 class TestAtomicity(LightCase):

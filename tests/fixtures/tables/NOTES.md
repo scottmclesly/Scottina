@@ -12,68 +12,66 @@ Schema is derived from `tables/validate.py` (the sole source of truth); the
 generator re-validates every store it writes, so a validator drift fails
 generation rather than emitting a stale fixture.
 
-## ⚠ Finding — §5c detail-file collision (settle before Light parses)
+## §5c detail-file collision — SETTLED (namespacing)
 
-`pgn-<num>.json` is **not namespaced by store**. Two *verified* stores that
-each define the same PGN, exported to one flat directory, collide on that
-filename. `synthetic-overlap` exists solely to demonstrate this: it redefines
-PGN **258050** (`0x3F002`), which `synthetic-basic` also defines.
+Detail files are **namespaced by store**: `<src>.pgn-<num>.json`. Two verified
+stores that both define a PGN now export side by side with no overwrite. Store
+names are `[a-z0-9_-]` (no dots), so the namespacing is unambiguous and a
+decode-only reader still tells a table (`<name>.json`, one dot) from a detail
+(two dots) by name alone.
 
-**Current exporter behaviour (characterised, pinned by
-`tests/test_fixtures_synthetic.py`):**
+`synthetic-overlap` redefines PGN **258050** (`0x3F002`), which
+`synthetic-basic` also defines. Its job is now to **prove namespacing works**
+— `test_fixtures_synthetic.py::test_overlapping_stores_export_side_by_side_no_overwrite`
+exports both and asserts `synthetic-basic.pgn-258050.json` (3 signals) and
+`synthetic-overlap.pgn-258050.json` (2 signals) both survive intact.
 
-- `lightindex.write_table_artifacts` writes each detail with `_write_atomic`
-  (tmp + `os.replace`), which **silently overwrites**. No error, no warning.
-- `screens/files.py::_export_light_index` iterates stores **sorted by name**,
-  so `synthetic-basic` writes `pgn-258050.json` first and `synthetic-overlap`
-  overwrites it. **Last store by sorted name wins.**
-- Net result: on disk, `pgn-258050.json` describes *overlap's* 2-field
-  variant, while `synthetic-basic.index.json` still lists 258050 as its own
-  3-signal `SYN Charlie` and points at that same file. **The earlier store's
-  index is left silently referencing another store's detail.** No diagnostic
-  anywhere.
+Rejected alternative, for the record: failing the export on cross-store PGN
+overlap. Canboat's `pgns.json` overlaps with every vendor table ever
+installed — overlap is the normal case, not an error.
 
-**Why it matters:** an index entry (`sig[].i` indices, signal names) and the
-detail file it points at can disagree, so Light would render one store's
-picker row against another store's field definitions — a plausible wrong
-decode, exactly the failure §5b/§5c exist to prevent. This is a **contract
-question, not a bug to patch here**: §5c has to decide one of
+**Detection on top of prevention (§5b):** each index entry carries the sha256
+of its detail file. A consumer hashes the file it loads and refuses a
+mismatched pair (`validate.detail_sha_ok`). Prevention (namespacing) plus
+detection (per-detail sha) — the standing two-gate rule.
 
-1. namespace detail files per store (e.g. `<src>.pgn-<num>.json`), or
-2. forbid exporting two stores that define the same PGN into one flat dir
-   (fail the export), or
-3. define a deterministic, *declared* winner and require every index to
-   carry the detail's own sha/identity so a consumer can detect the mismatch.
+### Consumer note — multiple indexes in one flat dir
 
-Cheaper to settle now, against this fixture, than after Light has a parser
-built around one assumption.
+A consumer loading a flat `/tables/` may now see **several** `<src>.index.json`
+files (one per exported store). Whether to merge them, present them as
+separate table sets, or prefer one is a **consumer-side decision**, not a
+contract one — the contract only guarantees each index and its namespaced
+detail files are internally consistent and sha-bound.
 
-## Contract gap — provenance has no schema home
+## Provenance warning — SETTLED (`warn` in the index header)
 
-The §2 table schema has **no field for a provenance/warning string**. The
-"this is synthetic" marker survives only as:
+The index header carries an optional **`warn`** string, populated at export
+from an explicit `_synthetic` flag in the table file if present, else the
+manifest's `source_doc`. Consumers render it **persistently**, so a synthetic
+fixture is structurally incapable of appearing on screen as a real reading.
 
-- `_synthetic` — a top-level key the validator ignores (unknown-key path), so
-  it is advisory to a human reading the file, not contract data; and
-- `source_doc` in the §3 manifest — authoritative, but set by the *writer* at
-  ingest (`store.install(..., source_doc=SOURCE_DOC)`), not carried by the
-  table file. The normal inbox path stamps `source_doc="inbox:<file>"`, which
-  would **lose** the warning.
-
-So a fixture ingested through the converter inbox is labelled by its filename,
-not by its synthetic nature. If §2 wants tables to be able to declare their
-own provenance, that field does not exist today.
+Provenance is deliberately **not** a §2 table-schema field: tables travel with
+manifests, and the index header is where the consumer actually looks. The
+`_synthetic` marker in these files is the export-time source for `warn`; every
+store here also ingests with `source_doc = SOURCE_DOC`, so either path yields
+the same banner.
 
 ## Schema notes (from `tables/validate.py`)
 
-Two constraints are *not* enforced by the validator, so the fixtures do not
-rely on them and Light must not either:
+Two rules that guard against a confident-wrong reading are now **enforced** by
+the validator (they were previously gaps this fixture set surfaced):
 
-- **No payload-fit / overlap check.** Only `BitOffset ≥ 0` and
-  `BitLength ∈ 1..64` are bounded. "Single-frame" is semantic (PF ≥ 240, not
-  fast), not a checked property of the field packing.
-- **`Resolution: 0` silently becomes 1** (`float(x or 1)`), same for `Offset`.
-  The fixtures never use 0 resolutions, so nothing is masked.
+- **`Resolution: 0` is a validation error.** It was silently coerced to `1`
+  (`float(x or 1)`); a real-table typo would then decode as raw counts and
+  look plausible.
+- **Single-frame (non-fast) PGNs must fit in 64 bits.** A field whose
+  `BitOffset + BitLength` exceeds 64 (one 8-byte CAN frame) is skipped with a
+  warning. Fast-packet PGNs assemble a larger payload and are exempt. The
+  check lives in the shared validator, so it protects Prime's live decode and
+  the Light export alike.
+
+The fixtures respect both: no 0 resolutions, and every single-frame field
+fits inside 64 bits.
 
 ## Non-usability safeguards
 
@@ -82,8 +80,8 @@ These must never decode a real bus by accident:
 - every PGN is in **data page 3** (`pgn >> 16 == 3`); NMEA2000 uses DP 0/1
   only, DP 2/3 are ISO/reserved — no real device emits these ids;
 - units are `SYN-`prefixed, lookup labels are `SYN-*`;
-- `source_doc` = `SYNTHETIC FIXTURE — not a real PGN table` and the file
-  carries the `_synthetic` marker.
+- `source_doc` = `SYNTHETIC FIXTURE — not a real PGN table`, the file carries
+  the `_synthetic` marker, and that marker becomes the index `warn` banner.
 
 ## Contents
 
@@ -105,4 +103,5 @@ These must never decode a real bus by accident:
 
 9 eligible PDU2 single-frame PGNs vs Light's 6-PGN picker limit → real
 selection pressure. `synthetic-overlap` — 1 PGN (0x3F002), a different
-2-signal definition, for the collision case above.
+2-signal definition, exported as `synthetic-overlap.pgn-258050.json`
+alongside basic's, proving the namespacing.

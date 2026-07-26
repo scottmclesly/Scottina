@@ -56,7 +56,8 @@ noted.
           "Name": "Voltage",          // required, string
           "BitOffset": 8,             // required, int ≥0 (LSB-first packing)
           "BitLength": 16,            // required, int 1..64
-          "Resolution": 0.01,         // default 1
+          "Resolution": 0.01,         // default 1; MUST NOT be 0 (a 0 scale
+                                      //   decodes as raw counts — rejected)
           "Offset": 0,                // engineering offset, default 0
           "Signed": false,            // default false
           "Units": "V",               // default ""
@@ -89,6 +90,19 @@ never fatal — a selection containing unknowns is legal, and the consumer
 presents its rate total as a lower bound. A non-integer or out-of-range
 value (≤0 or above the sane upper bound) is dropped to unknown with a
 warning, same two-tier discipline as the rest of §2.
+
+Two field-level rules guard against a confident-wrong reading (both
+two-tier: the offending field is skipped with a warning, the rest load):
+
+- **`Resolution` must not be 0.** A `0` scale was once silently coerced to
+  `1`; a real-table typo would then decode as raw counts and look entirely
+  plausible. It is now a validation error.
+- **A single-frame (non-`FastPacket`) PGN's fields must fit in 64 bits** —
+  one 8-byte CAN frame. A field whose `BitOffset + BitLength` exceeds 64 can
+  never carry data (a mislabelled fast-packet or a broken table) and is
+  skipped. Fast-packet PGNs assemble a larger payload and are exempt. Checked
+  in `tables/validate.py` (the shared gate) so it protects every consumer —
+  Prime's live decode and the Light export alike — not just one of them.
 
 Validation is **two-tier**: a malformed *file* (not JSON, no usable `PGNs`)
 is rejected outright; a malformed *entry* (bad field, missing `PGN`) is
@@ -150,10 +164,10 @@ directory:
 
 ```
 <media>/scottina/tables/
-├── victron_battery.json            # the table (§2) — decode-only
-├── victron_battery.meta.json       # its manifest (§3)
-├── victron_battery.index.json      # the Light index (§5b) — browse
-├── pgn-127508.json                 # per-PGN detail (§5c) — one per offered PGN
+├── victron_battery.json                 # the table (§2) — decode-only
+├── victron_battery.meta.json            # its manifest (§3)
+├── victron_battery.index.json           # the Light index (§5b) — browse
+├── victron_battery.pgn-127508.json      # per-PGN detail (§5c), namespaced
 └── …
 ```
 
@@ -161,25 +175,33 @@ Producers: the Files screen's *Tables → USB* export and the web app's
 per-table *download* / *index*. Both call **one shared writer**
 (`tables/lightindex.py`) so the two paths emit byte-identical artifacts.
 
-**Decode-only readers skip** `*.meta.json` and any `*.json` that has no
-top-level `PGNs` array (which is what the index and detail files are, so
-they are never mistaken for tables — TABLES.md gotcha). This is the same
-content-based skip the §2 two-tier rule already gives.
+**Detail and index files are namespaced by store** (`<src>.index.json`,
+`<src>.pgn-<num>.json`). Store names are `[a-z0-9_-]` — **no dots** — so two
+stores that both define a PGN never collide in one flat dir, and a
+decode-only reader tells a table (`<name>.json`, one dot) from an index or
+detail (two dots) by name alone.
+
+**Decode-only readers skip** `*.meta.json`, `*.index.json`,
+`*.pgn-*.json`, and — belt and braces — any `*.json` with no top-level
+`PGNs` array (which the index and detail files are). The same content-based
+skip the §2 two-tier rule already gives.
 
 ### 5b. The Light index — `<name>.index.json`
 
 A new emitted artifact *alongside* the flat table, **never a replacement**.
 Keys are abbreviated deliberately (parsed on a 192 KB device; budget
-~120 B/PGN, so 100 PGNs ≈ 12 KB) and it carries **names only** — no
-bit-field definitions:
+~190 B/PGN with the per-detail `sha`, so 100 PGNs ≈ 19 KB) and it carries
+**names only** — no bit-field definitions:
 
 ```json
 {"v": 1,
  "src": "<store name>",
  "sha256": "<of the source table file>",
  "generated": "<ISO8601>",
+ "warn": "<provenance banner, e.g. source_doc — rendered persistently>",
  "pgns": [
    {"pgn": 127508, "n": "Battery Status", "ms": 1500,
+    "sha": "<sha256 of this PGN's detail file>",
     "sig": [{"i": 0, "n": "Voltage", "u": "V"},
             {"i": 1, "n": "Current", "u": "A"}]}
  ]}
@@ -190,9 +212,21 @@ bit-field definitions:
   source manifest's `converted` time, so re-exporting an unchanged store is
   byte-stable. The index is **derived, never hand-maintained** — an index
   that drifts from its tables decodes plausible garbage.
-- `ms` is omitted when the interval is unknown; `sig[].i` indexes the
-  detail file's `fields` array (§5c); `sig[].u` is omitted when the signal
-  has no units.
+- `pgns[].sha` is the **sha256 of that PGN's detail file** (§5c). A consumer
+  hashes the detail it loads and refuses to decode on a mismatch — detection
+  on top of the namespacing that makes a cross-store collision structurally
+  impossible in the first place (two gates, §6). `validate.detail_sha_ok()`
+  is the read-side check.
+- `warn` (optional) is a **provenance banner** populated at export from the
+  table's explicit `_synthetic` flag if present, else the manifest's
+  `source_doc`. Consumers render it **persistently**, so a synthetic fixture
+  is structurally incapable of appearing on screen as a real reading.
+  Provenance lives here and in the §3 manifest — **never** in the §2 table
+  schema (tables travel with manifests; the index header is where the
+  consumer looks).
+- `ms` is omitted when the interval is unknown; `sha` when there is no
+  detail; `sig[].i` indexes the detail file's `fields` array (§5c);
+  `sig[].u` is omitted when the signal has no units.
 - **Fast-packet PGNs are excluded at export time.** Light cannot reassemble
   them safely — one dropped frame yields a plausible wrong value — so it
   must never be offered them. Enforced by the writer; Light keeps an
@@ -201,10 +235,12 @@ bit-field definitions:
   destination address that would have to be masked around in the consumer's
   hardware filters — out of scope for v1.
 
-### 5c. Per-PGN detail — `pgn-<num>.json`
+### 5c. Per-PGN detail — `<src>.pgn-<num>.json`
 
 The full §2 field definitions for one PGN, emitted for each PGN the index
-offers. The consumer loads only the handful it selected, one at a time:
+offers, **namespaced by store** so two stores that define the same PGN
+export side by side without overwriting. The consumer loads only the handful
+it selected, one at a time, and checks each against the index's `pgns[].sha`:
 
 ```json
 {"v": 1, "pgn": 127508, "name": "Battery Status", "fast": false,

@@ -1,10 +1,17 @@
 """Exercises the synthetic table fixtures (tests/fixtures/tables/) against the
-Light index export path, and PINS the §5c detail-file collision behaviour so
-it cannot change silently before Light's picker is written.
+Light index export path, and covers the §5c decisions that settled the
+detail-file collision:
+
+- detail files are namespaced by store (`<src>.pgn-<num>.json`), so two stores
+  defining the same PGN export side by side with NO overwrite;
+- each index entry carries the sha256 of its detail file, so a mismatched pair
+  is detectable (`validate.detail_sha_ok`);
+- the index header's `warn` provenance banner survives export;
+- and the two validator holes are closed: Resolution 0 and a single-frame PGN
+  packed past bit 64 are both rejected.
 
 Run from the repo root:  python -m unittest discover -s tests
-See tests/fixtures/tables/NOTES.md for the collision finding and the contract
-question it raises.
+See tests/fixtures/tables/NOTES.md for the settled contract decisions.
 """
 
 import json
@@ -43,7 +50,7 @@ class TestFixturesTracked(unittest.TestCase):
             self.assertEqual(_load(name)["_synthetic"], generate.SOURCE_DOC)
 
 
-class TestValidateAndIngest(unittest.TestCase):
+class _StoreCase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="syn-fix-")
         self._base = store.BASE
@@ -61,14 +68,14 @@ class TestValidateAndIngest(unittest.TestCase):
                       converter_version="1.0", pgn_count=len(tables))
         return tables, warns
 
+
+class TestValidateAndIngest(_StoreCase):
     def test_both_stores_validate_and_ingest_verified(self):
         for name in ("synthetic-basic", "synthetic-overlap"):
             self._ingest(name)
         inv = {t["name"]: t for t in store.list_tables()}
         self.assertTrue(inv["synthetic-basic"]["verified"])
         self.assertTrue(inv["synthetic-overlap"]["verified"])
-        # the warning source_doc landed in the manifest (the one authoritative
-        # place — the table file cannot carry it; see NOTES.md)
         self.assertEqual(inv["synthetic-basic"]["meta"]["source_doc"],
                          generate.SOURCE_DOC)
 
@@ -84,75 +91,100 @@ class TestValidateAndIngest(unittest.TestCase):
         index = json.loads(index_str)
         offered = {e["pgn"] for e in index["pgns"]}
         self.assertEqual(offered, set(generate.P))                # the 9 PDU2
-        # fast-packet + PDU1 absent from BOTH index and detail files
-        self.assertNotIn(generate.P_FAST, offered)
-        self.assertNotIn(generate.P_PDU1, offered)
-        self.assertNotIn(lightindex.detail_filename(generate.P_FAST), details)
-        self.assertNotIn(lightindex.detail_filename(generate.P_PDU1), details)
+        for excluded in (generate.P_FAST, generate.P_PDU1):
+            self.assertNotIn(excluded, offered)
+            self.assertNotIn(
+                lightindex.detail_filename("synthetic-basic", excluded),
+                details)
         self.assertEqual({int(json.loads(d)["pgn"]) for d in details.values()},
                          set(generate.P))
-        # 9 offered vs Light's 6-PGN cap → the selection pressure is real
-        self.assertGreater(len(offered), 6)
+        self.assertGreater(len(offered), 6)    # 9 vs Light's 6-PGN picker cap
 
     def test_units_and_lookups_reach_the_detail_files(self):
         self._ingest("synthetic-basic")
         _idx, details = lightindex.artifacts_for_table("synthetic-basic")
         merged = [json.loads(d) for d in details.values()]
-        has_units = any(f["units"] for d in merged for f in d["fields"])
-        has_lookup = any(f["lookup"] for d in merged for f in d["fields"])
-        self.assertTrue(has_units)
-        self.assertTrue(has_lookup)
+        self.assertTrue(any(f["units"] for d in merged for f in d["fields"]))
+        self.assertTrue(any(f["lookup"] for d in merged for f in d["fields"]))
 
 
-class TestDetailCollision(unittest.TestCase):
-    """PIN the §5c collision: two verified stores defining PGN 258050, exported
-    into one flat dir, collide on pgn-258050.json. Current behaviour is a
-    SILENT overwrite, last store by sorted name winning — no error, no warning.
-    This test locks that in so a future change to it is a deliberate, reviewed
-    contract decision (see NOTES.md)."""
+class TestNamespacingAndBinding(_StoreCase):
+    """The settled §5c: side-by-side export with no overwrite, plus the §5b
+    per-detail sha and `warn` header."""
 
     def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="syn-collide-")
-        self._base = store.BASE
-        store.BASE = self.tmp
-        store.ensure_dirs()
+        super().setUp()
         for name in ("synthetic-basic", "synthetic-overlap"):
-            obj = _load(name)
-            tables, _ = validate.validate(obj)
-            store.install(name, obj, source_doc=generate.SOURCE_DOC,
-                          converter_version="1.0", pgn_count=len(tables))
+            self._ingest(name)
 
-    def tearDown(self):
-        store.BASE = self._base
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def test_flat_export_silently_overwrites_last_sorted_wins(self):
+    def test_overlapping_stores_export_side_by_side_no_overwrite(self):
         dest = os.path.join(self.tmp, "flat")
-        order = []
         for t in sorted(store.list_tables(), key=lambda t: t["name"]):
-            if t["verified"]:
-                lightindex.write_table_artifacts(dest, t["name"])
-                order.append(t["name"])
-        self.assertEqual(order, ["synthetic-basic", "synthetic-overlap"])
+            lightindex.write_table_artifacts(dest, t["name"])
+        pgn = generate.P_OVERLAP                                   # 0x3F002
+        basic_fn = lightindex.detail_filename("synthetic-basic", pgn)
+        overlap_fn = lightindex.detail_filename("synthetic-overlap", pgn)
+        self.assertNotEqual(basic_fn, overlap_fn)                  # namespaced
+        with open(os.path.join(dest, basic_fn)) as f:
+            basic = json.load(f)
+        with open(os.path.join(dest, overlap_fn)) as f:
+            overlap = json.load(f)
+        # both survived — each store's own definition, neither clobbered
+        self.assertEqual(basic["name"], "SYN Charlie")
+        self.assertEqual(len(basic["fields"]), 3)
+        self.assertEqual(overlap["name"], "SYN Charlie OVERLAP VARIANT")
+        self.assertEqual(len(overlap["fields"]), 2)
+        # both index files present and internally consistent
+        for src in ("synthetic-basic", "synthetic-overlap"):
+            self.assertTrue(os.path.exists(
+                os.path.join(dest, lightindex.index_filename(src))))
 
-        detail_fn = lightindex.detail_filename(generate.P_OVERLAP)  # 258050
-        with open(os.path.join(dest, detail_fn)) as f:
-            on_disk = json.load(f)
-        # last exporter (synthetic-overlap, sorts after basic) won, silently
-        self.assertEqual(on_disk["name"], "SYN Charlie OVERLAP VARIANT")
-        self.assertEqual(len(on_disk["fields"]), 2)
+    def test_per_detail_sha_detects_a_tampered_pair(self):
+        index_str, details = lightindex.artifacts_for_table("synthetic-basic")
+        index = json.loads(index_str)
+        self.assertTrue(all("sha" in e for e in index["pgns"]))   # every entry
+        pgn = generate.P[0]
+        good = details[lightindex.detail_filename("synthetic-basic", pgn)]
+        self.assertTrue(validate.detail_sha_ok(index, pgn, good))
+        tampered = good.replace('"pgn"', '"pgn" ')   # 1 byte, still valid JSON
+        self.assertNotEqual(tampered, good)
+        self.assertFalse(validate.detail_sha_ok(index, pgn, tampered))
 
-        # ...yet BOTH indexes still reference 258050, and basic's index now
-        # points at a detail describing overlap's different definition
-        with open(os.path.join(dest, "synthetic-basic.index.json")) as f:
-            basic_idx = json.load(f)
-        basic_entry = next(e for e in basic_idx["pgns"]
-                           if e["pgn"] == generate.P_OVERLAP)
-        self.assertEqual(basic_entry["n"], "SYN Charlie")      # index claim
-        self.assertEqual(len(basic_entry["sig"]), 3)           # 3 signals
-        self.assertNotEqual(len(basic_entry["sig"]),
-                            len(on_disk["fields"]))            # detail differs
-        # the collision is invisible — no marker, no error was raised above
+    def test_warn_survives_export(self):
+        for src in ("synthetic-basic", "synthetic-overlap"):
+            index = json.loads(lightindex.artifacts_for_table(src)[0])
+            self.assertEqual(index["warn"], generate.SOURCE_DOC)
+
+
+class TestValidatorFixes(unittest.TestCase):
+    """The two confident-wrong-reading holes, closed in the shared validator."""
+
+    def _entry(self, fields, fast=False):
+        return {"PGNs": [{"PGN": 0x3F000, "Name": "X", "FastPacket": fast,
+                          "Fields": fields}]}
+
+    def test_resolution_zero_is_rejected(self):
+        # the sole field is invalid → the file has nothing usable → fatal
+        with self.assertRaises(validate.TableInvalid):
+            validate.validate(self._entry(
+                [{"Name": "z", "BitOffset": 0, "BitLength": 8,
+                  "Resolution": 0}]))
+        # alongside a good field: bad one skipped with a Resolution warning
+        tables, warns = validate.validate(self._entry([
+            {"Name": "z", "BitOffset": 0, "BitLength": 8, "Resolution": 0},
+            {"Name": "ok", "BitOffset": 8, "BitLength": 8, "Resolution": 0.1}]))
+        self.assertEqual([f["name"] for f in tables[0x3F000]["fields"]], ["ok"])
+        self.assertTrue(any("Resolution 0" in w for w in warns), warns)
+
+    def test_single_frame_field_past_bit_64_is_rejected(self):
+        over = {"Name": "past", "BitOffset": 60, "BitLength": 16}   # ends at 76
+        good = {"Name": "ok", "BitOffset": 0, "BitLength": 8}
+        tables, warns = validate.validate(self._entry([over, good]))
+        self.assertEqual([f["name"] for f in tables[0x3F000]["fields"]], ["ok"])
+        self.assertTrue(any("> 64" in w for w in warns), warns)
+        # a fast-packet PGN assembles a larger payload → the same field is kept
+        tables, _ = validate.validate(self._entry([over, good], fast=True))
+        self.assertEqual(len(tables[0x3F000]["fields"]), 2)
 
 
 if __name__ == "__main__":

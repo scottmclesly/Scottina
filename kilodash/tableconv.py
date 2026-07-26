@@ -492,7 +492,7 @@ def create_app(activity=None):
         if built is None:
             abort(404)
         _index, details = built
-        fn = lightindex.detail_filename(pgn)
+        fn = lightindex.detail_filename(name, pgn)
         if fn not in details:
             abort(404)
         return app.response_class(
