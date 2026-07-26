@@ -299,7 +299,17 @@ never read the inbox.
 Changing anything in §1–§6 means updating **all** of the above in one
 change, or not making the change.
 
-## 8. Open proposal — conditional fields (NOT yet in the schema)
+## 8. Conditional fields — DECISION: DEFERRED to v2 (not implemented now)
+
+> **Decision (settled — do not re-litigate).** The agreed direction is to
+> match **Canboat `LOOKUP_FIELDTYPE`** (a selector field whose value defines
+> the following field's type, carrying resolution + unit together). It is
+> **not implemented now.** The `Undecodable` field marker (§2) is a sufficient
+> fail-safe in the meantime — a conditional field is rendered not-available,
+> never a confident wrong value. **§8 lands with the real Canboat `pgns.json`
+> import as a v2 contract change**, so the schema gains conditional-field
+> support and Canboat interop in one step rather than piecemeal. Until then
+> the analysis below stands as the rationale; the choice is made.
 
 **Problem.** Proprietary marine PGNs commonly carry a field whose meaning —
 resolution *and* unit, sometimes the field type itself — depends on another
