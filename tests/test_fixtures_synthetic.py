@@ -156,6 +156,24 @@ class TestNamespacingAndBinding(_StoreCase):
             self.assertEqual(index["warn"], generate.SOURCE_DOC)
 
 
+class TestSyntheticInvalidStore(unittest.TestCase):
+    """The synthetic-invalid fixture proves both new validator checks fire on
+    a real store file (kept apart so synthetic-marine stays clean)."""
+
+    def test_store_is_rejected_and_each_reason_fires(self):
+        obj = _load("synthetic-invalid")
+        with self.assertRaises(validate.TableInvalid):     # nothing survives
+            validate.validate(obj)
+        reasons = {}
+        for entry in obj["PGNs"]:
+            try:
+                validate.validate({"PGNs": [entry]})
+            except validate.TableInvalid as e:
+                reasons[entry["Name"]] = str(e)
+        self.assertIn("Resolution 0", reasons["SYN Bad Resolution"])
+        self.assertIn("> 64", reasons["SYN Past Frame"])
+
+
 class TestValidatorFixes(unittest.TestCase):
     """The two confident-wrong-reading holes, closed in the shared validator."""
 

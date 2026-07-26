@@ -123,6 +123,132 @@ def build_overlap():
     ])
 
 
+# ==========================================================================
+# synthetic-marine — the decode-RICHNESS store (bench test kit, Phase 1).
+# Copies the *shape* of a proprietary marine PGN (manufacturer header, bit
+# flags, lookup enums, signed + not-available, a conditional field) and
+# invents every byte. DP3 + manufacturer 2047 keep it off any real bus; no
+# field carries actuation semantics (SYN- neutral names only).
+# ==========================================================================
+# nine eligible single-frame PDU2 (PF 0xF1, PS 0..8), one fast, one PDU1
+_MF = [_pgn(0xF1, i) for i in range(9)]
+MF_A, MF_B, MR_A, MR_B, MENV, MFLG, MENU, MUNK, MNOI = _MF
+M_FAST = _pgn(0xFC, 0)                     # fast-packet → excluded from index
+M_PDU1 = _pgn(0x11, 0)                     # PF 0x11 < 240 → PDU1 → excluded
+MARINE_ELIGIBLE = list(_MF)
+
+# 2047 = 0x7FF: an UNASSIGNED manufacturer code AND the all-ones 11-bit value,
+# so it doubly cannot present as a real manufacturer (§2 decodes it as NA).
+MANUFACTURER_ID = 2047
+# Category lookup. Note 15 (0xF) is the all-ones 4-bit NA sentinel, so its
+# label is shadowed by the not-available rule — see NOTES / gap report.
+CATEGORY_LOOKUP = {"0": "SYN-Alpha", "1": "SYN-Bravo", "2": "SYN-Charlie",
+                   "14": "SYN-Error", "15": "SYN-NotAvail"}
+
+
+def _mf(name, off, ln, res=1, signed=False, units="", lookup=None):
+    f = {"Name": name, "BitOffset": off, "BitLength": ln,
+         "Resolution": res, "Signed": signed, "Units": units}
+    if lookup:
+        f["Lookup"] = lookup
+    return f
+
+
+def _feedback_fields():
+    """SYN Feedback A/B — the shape test, EXACTLY 64 bits (payload-fit
+    boundary). Field 11 is conditional: §2 can encode only one variant."""
+    return [
+        _mf("SYN Manufacturer ID", 0, 11),        # fixed 2047 (= NA sentinel)
+        _mf("SYN Reserved 1", 11, 2),
+        _mf("SYN Industry Group", 13, 3),
+        _mf("SYN Source Instance", 16, 4),
+        _mf("SYN Mode Flags", 20, 4),             # per-bit; §2 has no bit names
+        _mf("SYN Status Flags", 24, 4),
+        _mf("SYN Select", 28, 4),                 # bit1 picks field 11
+        _mf("SYN Category", 32, 4, lookup=CATEGORY_LOOKUP),
+        _mf("SYN Reserved 2", 36, 4),
+        _mf("SYN Signed Level", 40, 8, signed=True),   # -100..100, NA 0x7F
+        # conditional: §2 can only carry ONE (res,unit). Encoded variant =
+        # Select bit1==0 (0.1 SYN-pct); the Select bit1==1 meaning (0.25
+        # SYN-rpm) is unrepresentable — the emitter records the divergence.
+        _mf("SYN Scaled Value", 48, 16, res=0.1, units="SYN-pct"),
+    ]
+
+
+def _rapid_fields():
+    return [_mf("SYN Counter", 0, 8),
+            _mf("SYN Rapid Value", 8, 16, res=0.01, units="SYN-u")]
+
+
+def _env_fields():
+    return [_mf("SYN Temp", 0, 16, res=0.01, signed=True, units="SYN-degC"),
+            _mf("SYN Pressure", 16, 16, res=0.1, units="SYN-kPa")]
+
+
+def _flag_fields():
+    # pure bit-flags: §2 cannot name bits, so the ONLY faithful encoding is
+    # one 1-bit field per flag (1-bit fields have no NA sentinel, so all-set
+    # is representable — unlike a wide flag field, whose all-ones = NA).
+    return [_mf(f"SYN Flag {i}", i, 1) for i in range(8)]
+
+
+def _enum_fields():
+    return [_mf("SYN Enum A", 0, 4, lookup=CATEGORY_LOOKUP),
+            _mf("SYN Enum B", 4, 4, lookup=dict(_ENUM))]
+
+
+def _noise_fields():
+    return [_mf("SYN Noise Value", 0, 16, units="SYN-u")]
+
+
+def _fast_fields():
+    # fast-packet: fields legitimately span past 64 bits (assembled payload),
+    # which also proves the single-frame payload-fit check is fast-exempt.
+    return [_mf(f"SYN FP {i}", i * 16, 16, res=0.1, units="SYN-u")
+            for i in range(6)]                     # 0..95 bits
+
+
+def _entry_f(pgn, name, fields, *, interval=None, fast=False):
+    e = {"PGN": pgn, "Name": name, "FastPacket": fast, "Fields": fields}
+    if interval is not None:
+        e["TransmissionInterval"] = interval
+    return e
+
+
+def build_marine():
+    """Decode-richness store: 9 eligible single-frame PDU2 PGNs (real 6-PGN
+    picker pressure) with the full field-shape set, plus a fast-packet and a
+    PDU1 that the index must exclude. SYN Noise is the always-present,
+    never-selected negative-control target for the filter run (Phase 5)."""
+    return _wrap([
+        _entry_f(MF_A, "SYN Feedback A", _feedback_fields(), interval=100),
+        _entry_f(MF_B, "SYN Feedback B", _feedback_fields(), interval=100),
+        _entry_f(MR_A, "SYN Rapid A", _rapid_fields(), interval=20),
+        _entry_f(MR_B, "SYN Rapid B", _rapid_fields(), interval=20),
+        _entry_f(MENV, "SYN Environment", _env_fields(), interval=1000),
+        _entry_f(MFLG, "SYN Flags", _flag_fields(), interval=500),
+        _entry_f(MENU, "SYN Enums", _enum_fields(), interval=1000),
+        _entry_f(MUNK, "SYN Unknown", _rapid_fields()),         # no interval
+        _entry_f(MNOI, "SYN Noise", _noise_fields(), interval=50),
+        _entry_f(M_FAST, "SYN FastPacket", _fast_fields(),
+                 interval=500, fast=True),                      # EXCLUDED
+        _entry_f(M_PDU1, "SYN PDU1", _noise_fields(), interval=1000),  # EXCLUDED
+    ])
+
+
+def build_invalid():
+    """A store the validator must REJECT — one field with Resolution 0, one
+    field extending past bit 64 of a single-frame PGN. Kept apart from
+    synthetic-marine so that one stays clean; proves the two validator checks
+    fire (test asserts each raises with the right reason)."""
+    return _wrap([
+        _entry_f(_pgn(0xF2, 0), "SYN Bad Resolution",
+                 [_mf("SYN zero-scale", 0, 8, res=0)]),
+        _entry_f(_pgn(0xF2, 1), "SYN Past Frame",
+                 [_mf("SYN overrun", 60, 16)]),               # ends at 76 > 64
+    ])
+
+
 def _wrap(pgns):
     return {"_synthetic": SOURCE_DOC,
             "_note": "Plumbing fixture — invented ids/offsets, DP3 reserved, "
@@ -130,12 +256,22 @@ def _wrap(pgns):
             "PGNs": pgns}
 
 
-STORES = {"synthetic-basic": build_basic, "synthetic-overlap": build_overlap}
+STORES = {"synthetic-basic": build_basic, "synthetic-overlap": build_overlap,
+          "synthetic-marine": build_marine, "synthetic-invalid": build_invalid}
 
 
 def _selfcheck(name, obj):
     """Re-validate against tables/validate.py and assert the properties the
     fixtures exist to guarantee — so a generator/validator drift fails here."""
+    if name == "synthetic-invalid":
+        # this store exists to be REJECTED — both bad fields are the only
+        # fields on their PGNs, so nothing survives and the file is fatal.
+        try:
+            validate.validate(obj)
+        except validate.TableInvalid:
+            return None, None
+        raise AssertionError("synthetic-invalid unexpectedly validated clean")
+
     tables, warns = validate.validate(obj)
     eligible = {p for p, e in tables.items() if lightindex.eligible(e)}
     if name == "synthetic-basic":
@@ -147,6 +283,15 @@ def _selfcheck(name, obj):
         assert any("out of 1.." in w for w in warns), warns   # with a warning
         assert any(f["lookup"] for f in tables[P[7]]["fields"])
         assert any(f["units"] for f in tables[P[0]]["fields"])
+    if name == "synthetic-marine":
+        assert eligible == set(MARINE_ELIGIBLE), sorted(eligible)
+        assert not lightindex.eligible(tables[M_FAST])        # fast excluded
+        assert not lightindex.eligible(tables[M_PDU1])        # PDU1 excluded
+        fa = tables[MF_A]["fields"]
+        assert len(fa) == 11                                  # nothing dropped
+        assert fa[-1]["bit_offset"] + fa[-1]["bit_length"] == 64  # boundary
+        assert tables[MUNK]["interval_ms"] is None            # lower-bound path
+        assert any(f["lookup"] for f in tables[MENU]["fields"])
     return tables, warns
 
 

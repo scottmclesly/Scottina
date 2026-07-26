@@ -41,8 +41,17 @@ Two prerequisites to make it runnable next time:
 1. **Load `i2c-dev` at boot** so `/dev/i2c-1` exists without a manual
    `modprobe` — `echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf`.
 2. **A CAN traffic source on the same bus** — CanTick dialed in (`slcan0`), or
-   an MCP2515 CAN HAT (`dtoverlay=mcp2515-can0,oscillator=…,interrupt=…` →
-   `can0`) driven by `cangen`.
+   the `gs_usb` USB-CAN adapter (`can0`, now present on Prime but DOWN and a
+   single node) up at 250 k with a second node.
+
+**Preferred traffic source: the synthetic bench kit** ([`tools/bench/`](../tools/bench/README.md)),
+not `cangen`. It emits the `synthetic-marine` PGNs at known fixed ids, so
+every id on the bus means something and the filter output is unambiguous. In
+particular **`SYN Noise` (`0x3F108`) is the natural negative-control target**:
+it is always on the bus and never selected, so a filter that admits the
+selected ids and drops `SYN Noise` is unambiguous in the count — better than
+`cangen`'s random ids. Program the positive filter for a selected id (e.g.
+`SYN Feedback A`, `0x3F100`) and the negative-control filter for `SYN Noise`.
 
 ---
 

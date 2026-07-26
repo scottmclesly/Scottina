@@ -1,0 +1,503 @@
+{
+  "_synthetic": "SYNTHETIC FIXTURE — not a real PGN table",
+  "_note": "Plumbing fixture — invented ids/offsets, DP3 reserved, not usable on a real bus. Regenerate via generate.py.",
+  "PGNs": [
+    {
+      "PGN": 258304,
+      "Name": "SYN Feedback A",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Manufacturer ID",
+          "BitOffset": 0,
+          "BitLength": 11,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Reserved 1",
+          "BitOffset": 11,
+          "BitLength": 2,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Industry Group",
+          "BitOffset": 13,
+          "BitLength": 3,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Source Instance",
+          "BitOffset": 16,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Mode Flags",
+          "BitOffset": 20,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Status Flags",
+          "BitOffset": 24,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Select",
+          "BitOffset": 28,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Category",
+          "BitOffset": 32,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "",
+          "Lookup": {
+            "0": "SYN-Alpha",
+            "1": "SYN-Bravo",
+            "2": "SYN-Charlie",
+            "14": "SYN-Error",
+            "15": "SYN-NotAvail"
+          }
+        },
+        {
+          "Name": "SYN Reserved 2",
+          "BitOffset": 36,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Signed Level",
+          "BitOffset": 40,
+          "BitLength": 8,
+          "Resolution": 1,
+          "Signed": true,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Scaled Value",
+          "BitOffset": 48,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-pct"
+        }
+      ],
+      "TransmissionInterval": 100
+    },
+    {
+      "PGN": 258305,
+      "Name": "SYN Feedback B",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Manufacturer ID",
+          "BitOffset": 0,
+          "BitLength": 11,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Reserved 1",
+          "BitOffset": 11,
+          "BitLength": 2,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Industry Group",
+          "BitOffset": 13,
+          "BitLength": 3,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Source Instance",
+          "BitOffset": 16,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Mode Flags",
+          "BitOffset": 20,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Status Flags",
+          "BitOffset": 24,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Select",
+          "BitOffset": 28,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Category",
+          "BitOffset": 32,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "",
+          "Lookup": {
+            "0": "SYN-Alpha",
+            "1": "SYN-Bravo",
+            "2": "SYN-Charlie",
+            "14": "SYN-Error",
+            "15": "SYN-NotAvail"
+          }
+        },
+        {
+          "Name": "SYN Reserved 2",
+          "BitOffset": 36,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Signed Level",
+          "BitOffset": 40,
+          "BitLength": 8,
+          "Resolution": 1,
+          "Signed": true,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Scaled Value",
+          "BitOffset": 48,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-pct"
+        }
+      ],
+      "TransmissionInterval": 100
+    },
+    {
+      "PGN": 258306,
+      "Name": "SYN Rapid A",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Counter",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Rapid Value",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": false,
+          "Units": "SYN-u"
+        }
+      ],
+      "TransmissionInterval": 20
+    },
+    {
+      "PGN": 258307,
+      "Name": "SYN Rapid B",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Counter",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Rapid Value",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": false,
+          "Units": "SYN-u"
+        }
+      ],
+      "TransmissionInterval": 20
+    },
+    {
+      "PGN": 258308,
+      "Name": "SYN Environment",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Temp",
+          "BitOffset": 0,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "SYN Pressure",
+          "BitOffset": 16,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-kPa"
+        }
+      ],
+      "TransmissionInterval": 1000
+    },
+    {
+      "PGN": 258309,
+      "Name": "SYN Flags",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Flag 0",
+          "BitOffset": 0,
+          "BitLength": 1,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Flag 1",
+          "BitOffset": 1,
+          "BitLength": 1,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Flag 2",
+          "BitOffset": 2,
+          "BitLength": 1,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Flag 3",
+          "BitOffset": 3,
+          "BitLength": 1,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Flag 4",
+          "BitOffset": 4,
+          "BitLength": 1,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Flag 5",
+          "BitOffset": 5,
+          "BitLength": 1,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Flag 6",
+          "BitOffset": 6,
+          "BitLength": 1,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Flag 7",
+          "BitOffset": 7,
+          "BitLength": 1,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        }
+      ],
+      "TransmissionInterval": 500
+    },
+    {
+      "PGN": 258310,
+      "Name": "SYN Enums",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Enum A",
+          "BitOffset": 0,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "",
+          "Lookup": {
+            "0": "SYN-Alpha",
+            "1": "SYN-Bravo",
+            "2": "SYN-Charlie",
+            "14": "SYN-Error",
+            "15": "SYN-NotAvail"
+          }
+        },
+        {
+          "Name": "SYN Enum B",
+          "BitOffset": 4,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "",
+          "Lookup": {
+            "0": "SYN-OFF",
+            "1": "SYN-ON",
+            "2": "SYN-FAULT"
+          }
+        }
+      ],
+      "TransmissionInterval": 1000
+    },
+    {
+      "PGN": 258311,
+      "Name": "SYN Unknown",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Counter",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        },
+        {
+          "Name": "SYN Rapid Value",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": false,
+          "Units": "SYN-u"
+        }
+      ]
+    },
+    {
+      "PGN": 258312,
+      "Name": "SYN Noise",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Noise Value",
+          "BitOffset": 0,
+          "BitLength": 16,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "SYN-u"
+        }
+      ],
+      "TransmissionInterval": 50
+    },
+    {
+      "PGN": 261120,
+      "Name": "SYN FastPacket",
+      "FastPacket": true,
+      "Fields": [
+        {
+          "Name": "SYN FP 0",
+          "BitOffset": 0,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-u"
+        },
+        {
+          "Name": "SYN FP 1",
+          "BitOffset": 16,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-u"
+        },
+        {
+          "Name": "SYN FP 2",
+          "BitOffset": 32,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-u"
+        },
+        {
+          "Name": "SYN FP 3",
+          "BitOffset": 48,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-u"
+        },
+        {
+          "Name": "SYN FP 4",
+          "BitOffset": 64,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-u"
+        },
+        {
+          "Name": "SYN FP 5",
+          "BitOffset": 80,
+          "BitLength": 16,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-u"
+        }
+      ],
+      "TransmissionInterval": 500
+    },
+    {
+      "PGN": 200960,
+      "Name": "SYN PDU1",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN Noise Value",
+          "BitOffset": 0,
+          "BitLength": 16,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "SYN-u"
+        }
+      ],
+      "TransmissionInterval": 1000
+    }
+  ]
+}

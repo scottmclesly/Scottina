@@ -105,3 +105,17 @@ These must never decode a real bus by accident:
 selection pressure. `synthetic-overlap` — 1 PGN (0x3F002), a different
 2-signal definition, exported as `synthetic-overlap.pgn-258050.json`
 alongside basic's, proving the namespacing.
+
+## Other stores in this directory
+
+- **`synthetic-marine`** — the decode-RICHNESS store (bench test kit): 9
+  eligible PGNs with a full field-shape set (manufacturer header, bit flags,
+  lookup enums, signed + not-available, a conditional field), plus a
+  fast-packet and a PDU1 the index excludes. It is the ground-truth emitter's
+  table; the §2 schema gaps it surfaces (conditional field, per-bit flags, NA
+  sentinel collisions) are reported in
+  [`tools/bench/README.md`](../../../tools/bench/README.md).
+- **`synthetic-invalid`** — a store the validator must **reject**: one field
+  with `Resolution: 0`, one field extending past bit 64 of a single-frame
+  PGN. Kept apart so `synthetic-marine` validates clean; proves the two
+  validator checks fire (`test_fixtures_synthetic.py`).

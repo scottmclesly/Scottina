@@ -3,14 +3,21 @@ code (GPS-Integration TODO: "evolve the AST scan from 'no TX anywhere' to
 a positive allow-list of TX-permitted modules").
 
 The scope constraint it makes executable: diagnostics only, with exactly
-two named TX exceptions — (1) link-layer heartbeat/reply behavior required
-by bus participation (lives in CanTick firmware, not in this tree), and
-(2) the GNSS source node `n2k/node.py` (address claim, claim defense, ISO
-request responses, the five GNSS PGNs), started and stopped only by an
-explicit user action. Any send-shaped call on a socket in ANY other module
-hard-fails the build; modules that legitimately speak non-CAN sockets are
-each named with their justification. The per-module RX-only scans in
+two named RUNTIME TX exceptions — (1) link-layer heartbeat/reply behavior
+required by bus participation (lives in CanTick firmware, not in this tree),
+and (2) the GNSS source node `n2k/node.py` (address claim, claim defense,
+ISO request responses, the five GNSS PGNs), started and stopped only by an
+explicit user action. Any send-shaped call on a socket in ANY other Scottina
+module hard-fails the build; modules that legitimately speak non-CAN sockets
+are each named with their justification. The per-module RX-only scans in
 tests/test_busmon.py / test_n2k.py remain as the independent reject pass.
+
+Separately, **bench equipment** under `tools/bench/` is NOT Scottina runtime
+and may transmit — it is a shell/harness generator, gated behind
+`--bench-bus-confirmed`, and no Scottina package imports or constructs its
+frames (enforced by tests/test_syn_emitter.py). Such files are named in
+BENCH_CAN_TX, kept apart from the runtime carve-out so the "what Scottina may
+put on the bus" answer stays exactly (1)+(2).
 
 Run from the repo root:  python -m unittest discover -s tests
 """
@@ -25,9 +32,18 @@ sys.path.insert(0, ROOT)
 
 SCAN_ROOTS = ("kilodash", "gps", "tables", "n2k", "microkvm", "tools")
 
-# The positive allow-list: modules permitted to transmit on a CAN socket.
+# The positive allow-list: RUNTIME modules permitted to transmit on a CAN
+# socket. Growing this set is a scope decision (see the carve-out test).
 ALLOWED_CAN_TX = {
     "n2k/node.py",          # GNSS source node — the Phase 3 carve-out
+}
+
+# Bench equipment permitted to transmit — NOT Scottina runtime. Gated behind
+# --bench-bus-confirmed, never imported/constructed by any Scottina package
+# (tests/test_syn_emitter.py enforces that boundary). Kept apart from
+# ALLOWED_CAN_TX so the runtime answer stays exactly the two carve-outs.
+BENCH_CAN_TX = {
+    "tools/bench/syn-emitter.py",   # synthetic ground-truth emitter
 }
 
 # Modules permitted send-family calls on NON-CAN sockets, each justified.
@@ -69,7 +85,7 @@ def scan_source(relpath, text):
                   if isinstance(n, ast.Attribute)}
     referenced |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
     is_can_module = bool(referenced & CAN_MARKERS)
-    can_ok = relpath in ALLOWED_CAN_TX
+    can_ok = relpath in ALLOWED_CAN_TX or relpath in BENCH_CAN_TX
     net_ok = relpath in ALLOWED_NET_SEND
     out = []
     for call in (n for n in ast.walk(tree) if isinstance(n, ast.Call)):
@@ -118,9 +134,17 @@ class TestTreeWideTxScan(unittest.TestCase):
                          "\n".join(["CAN-TX scope violations:"] + violations))
 
     def test_allow_list_is_exactly_the_carve_out(self):
-        """The carve-out is these modules and no more — growing the list
-        is a scope decision, not a refactor detail."""
+        """The runtime carve-out is these modules and no more — growing the
+        list is a scope decision, not a refactor detail."""
         self.assertEqual(ALLOWED_CAN_TX, {"n2k/node.py"})
+
+    def test_bench_tx_is_exactly_the_emitter_and_is_bench_only(self):
+        """Bench TX is separate from the runtime carve-out, and every entry
+        must live under tools/bench/ — never inside a Scottina package."""
+        self.assertEqual(BENCH_CAN_TX, {"tools/bench/syn-emitter.py"})
+        for rel in BENCH_CAN_TX:
+            self.assertTrue(rel.startswith("tools/bench/"), rel)
+            self.assertFalse(rel.startswith("kilodash/"), rel)
 
 
 class TestScanCatches(unittest.TestCase):
