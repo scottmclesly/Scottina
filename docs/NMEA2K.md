@@ -75,7 +75,9 @@ runs on the Pi, reviewed from a big screen. Install once with
   manifest land in the store (atomically).
 - **Installed tab** — the same inventory as the tile (they read the same
   store, so they can never disagree) plus **download** (the flat SD-export
-  shape Wio Terminal Island reads) and **inbox ingest**: files dropped
+  table for decode-only consumers) and **index** (Scottina Light's
+  browse-then-decode index, TABLES.md §5b/§5c) and **inbox ingest**: files
+  dropped
   into `tables/` by hand or by the [Files](FILES.md) screen's USB import
   are inert until validated and ingested here.
 - **DBC tab** — stub; the same ingest→validate→store flow into
@@ -90,7 +92,7 @@ half-written table.
 | Path | Direction | Shape |
 |---|---|---|
 | Converter web app | PDF → store | validated + manifested |
-| Web *download* / Files **Tables → USB** | store → laptop / SD | flat dir: `<name>.json` + `<name>.meta.json` (TABLES.md §5 — feeds Wio Terminal Island) |
+| Web *download* / Files **Tables → USB** | store → laptop / SD | flat dir: `<name>.json` + `<name>.meta.json`, plus Light's `<name>.index.json` + `pgn-<num>.json` browse artifacts (TABLES.md §5/§5b/§5c — feeds Scottina Light) |
 | Files **Tables ← USB** / `scp` | stick → `tables/` inbox | inert until ingested on the Installed tab |
 
 ## Troubleshooting

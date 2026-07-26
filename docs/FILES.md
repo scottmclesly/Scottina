@@ -74,7 +74,9 @@ files land in the `tables/` **inbox**, where they are inert. To feed the
 [NMEA2K screen](NMEA2K.md)'s live decode they must pass validation once —
 open the **Tables** tile → converter → *Installed* tab → **Validate &
 ingest**. **Tables → USB** exports both the inbox and the installed store
-(tables + manifests, flat) — the SD shape Wio Terminal Island reads.
+(tables + manifests, flat) — the SD shape Scottina Light reads — and emits
+Light's browse index (`<name>.index.json` + `pgn-<num>.json`, TABLES.md
+§5b/§5c) alongside it, so Light's CAN gauge can offer a PGN picker.
 
 ## Notes & guardrails
 

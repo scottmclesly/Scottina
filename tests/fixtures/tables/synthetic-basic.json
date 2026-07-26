@@ -1,0 +1,351 @@
+{
+  "_synthetic": "SYNTHETIC FIXTURE — not a real PGN table",
+  "_note": "Plumbing fixture — invented ids/offsets, DP3 reserved, not usable on a real bus. Regenerate via generate.py.",
+  "PGNs": [
+    {
+      "PGN": 258048,
+      "Name": "SYN Alpha",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Alpha Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        }
+      ],
+      "TransmissionInterval": 100
+    },
+    {
+      "PGN": 258049,
+      "Name": "SYN Bravo",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Bravo Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Bravo Sig 1",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-V"
+        }
+      ],
+      "TransmissionInterval": 100
+    },
+    {
+      "PGN": 258050,
+      "Name": "SYN Charlie",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Charlie Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Charlie Sig 1",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-V"
+        },
+        {
+          "Name": "Charlie Sig 2",
+          "BitOffset": 24,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "SYN-m"
+        }
+      ],
+      "TransmissionInterval": 1000
+    },
+    {
+      "PGN": 258051,
+      "Name": "SYN Delta",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Delta Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Delta Sig 1",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-V"
+        },
+        {
+          "Name": "Delta Sig 2",
+          "BitOffset": 24,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "SYN-m"
+        },
+        {
+          "Name": "Delta Sig 3",
+          "BitOffset": 28,
+          "BitLength": 16,
+          "Resolution": 0.001,
+          "Signed": true,
+          "Units": "SYN-rad"
+        }
+      ],
+      "TransmissionInterval": 1000
+    },
+    {
+      "PGN": 258052,
+      "Name": "SYN Echo",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Echo Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Echo Sig 1",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-V"
+        },
+        {
+          "Name": "Echo Sig 2",
+          "BitOffset": 24,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "SYN-m"
+        },
+        {
+          "Name": "Echo Sig 3",
+          "BitOffset": 28,
+          "BitLength": 16,
+          "Resolution": 0.001,
+          "Signed": true,
+          "Units": "SYN-rad"
+        },
+        {
+          "Name": "Echo Sig 4",
+          "BitOffset": 44,
+          "BitLength": 8,
+          "Resolution": 0.5,
+          "Signed": false,
+          "Units": "SYN-kn"
+        }
+      ],
+      "TransmissionInterval": 5000
+    },
+    {
+      "PGN": 258053,
+      "Name": "SYN Foxtrot",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Foxtrot Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Foxtrot Sig 1",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-V"
+        },
+        {
+          "Name": "Foxtrot Sig 2",
+          "BitOffset": 24,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "SYN-m"
+        },
+        {
+          "Name": "Foxtrot Sig 3",
+          "BitOffset": 28,
+          "BitLength": 16,
+          "Resolution": 0.001,
+          "Signed": true,
+          "Units": "SYN-rad"
+        },
+        {
+          "Name": "Foxtrot Sig 4",
+          "BitOffset": 44,
+          "BitLength": 8,
+          "Resolution": 0.5,
+          "Signed": false,
+          "Units": "SYN-kn"
+        },
+        {
+          "Name": "Foxtrot Sig 5",
+          "BitOffset": 52,
+          "BitLength": 12,
+          "Resolution": 0.25,
+          "Signed": true,
+          "Units": "SYN-pct"
+        }
+      ]
+    },
+    {
+      "PGN": 258054,
+      "Name": "SYN Golf",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Golf Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Golf Sig 1",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-V"
+        }
+      ],
+      "TransmissionInterval": 999999999
+    },
+    {
+      "PGN": 258055,
+      "Name": "SYN Hotel",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Hotel Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Hotel Sig 1",
+          "BitOffset": 8,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": true,
+          "Units": "",
+          "Lookup": {
+            "0": "SYN-OFF",
+            "1": "SYN-ON",
+            "2": "SYN-FAULT"
+          }
+        },
+        {
+          "Name": "Hotel Sig 2",
+          "BitOffset": 12,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "SYN-m"
+        }
+      ],
+      "TransmissionInterval": 250
+    },
+    {
+      "PGN": 258056,
+      "Name": "SYN India",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "India Sig 0",
+          "BitOffset": 0,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "",
+          "Lookup": {
+            "0": "SYN-OFF",
+            "1": "SYN-ON",
+            "2": "SYN-FAULT"
+          }
+        }
+      ],
+      "TransmissionInterval": 100
+    },
+    {
+      "PGN": 260864,
+      "Name": "SYN Juliet (fast-packet)",
+      "FastPacket": true,
+      "Fields": [
+        {
+          "Name": "Juliet Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        },
+        {
+          "Name": "Juliet Sig 1",
+          "BitOffset": 8,
+          "BitLength": 16,
+          "Resolution": 0.01,
+          "Signed": true,
+          "Units": "SYN-V"
+        },
+        {
+          "Name": "Juliet Sig 2",
+          "BitOffset": 24,
+          "BitLength": 4,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": "SYN-m"
+        }
+      ],
+      "TransmissionInterval": 1000
+    },
+    {
+      "PGN": 200704,
+      "Name": "SYN Kilo (PDU1)",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "Kilo Sig 0",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0.1,
+          "Signed": false,
+          "Units": "SYN-degC"
+        }
+      ],
+      "TransmissionInterval": 100
+    }
+  ]
+}

@@ -1,0 +1,36 @@
+{
+  "_synthetic": "SYNTHETIC FIXTURE — not a real PGN table",
+  "_note": "Plumbing fixture — invented ids/offsets, DP3 reserved, not usable on a real bus. Regenerate via generate.py.",
+  "PGNs": [
+    {
+      "PGN": 258560,
+      "Name": "SYN Bad Resolution",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN zero-scale",
+          "BitOffset": 0,
+          "BitLength": 8,
+          "Resolution": 0,
+          "Signed": false,
+          "Units": ""
+        }
+      ]
+    },
+    {
+      "PGN": 258561,
+      "Name": "SYN Past Frame",
+      "FastPacket": false,
+      "Fields": [
+        {
+          "Name": "SYN overrun",
+          "BitOffset": 60,
+          "BitLength": 16,
+          "Resolution": 1,
+          "Signed": false,
+          "Units": ""
+        }
+      ]
+    }
+  ]
+}

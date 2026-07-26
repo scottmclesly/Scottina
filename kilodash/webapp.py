@@ -157,6 +157,14 @@ class WebApp:
                 self.proc = subprocess.Popen(cmd, stdout=out, stderr=out,
                                              stdin=subprocess.DEVNULL)
             elif self.service:
+                if not self.installed():
+                    # "unit not installed" is NOT a fault — there is no
+                    # journal to point at. Stay STOPPED so the screen can
+                    # show the remedy (run the installer) instead of a
+                    # generic FAULT. Distinct state from installed-but-failed.
+                    self.state = STOPPED
+                    self.message = f"{self.service} not installed"
+                    return
                 r = subprocess.run(["systemctl", "start", self.service],
                                    capture_output=True, text=True, timeout=20)
                 if r.returncode != 0:

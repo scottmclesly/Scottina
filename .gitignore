@@ -14,9 +14,14 @@ mesh-secrets.env
 captures/*
 !captures/.gitkeep
 
-# Decode tables imported from USB (DBC / NMEA) — per-boat artefacts
+# Decode tables imported from USB (DBC / NMEA) — per-boat artefacts.
+# The store CONTRACT code lives in-tree; only the table data is ignored.
 tables/*
 !tables/.gitkeep
+!tables/__init__.py
+!tables/store.py
+!tables/validate.py
+!tables/lightindex.py
 
 # Capture / log artefacts anywhere in the tree
 *.cu8
