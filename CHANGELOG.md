@@ -33,9 +33,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   - `TABLES.md` §2 gains an optional `interval_ms` (Canboat
     `TransmissionInterval`); `tables/validate.py` range-checks it and
     validates the index shape (`validate_index` / `check_pair`).
+- **`TABLES.md` §2 `Undecodable` field marker** — an optional per-field
+  fail-safe: a field the schema cannot correctly interpret is rendered
+  not-available (`n/d`) with a reason instead of a computed value. The flag
+  travels into the §5c detail file so Light fail-safes it too; the §5b index
+  omits its unit but still lists the signal. `TABLES.md` §8 proposes the
+  actual conditional-field extension (recommendation: match Canboat
+  `LOOKUP_FIELDTYPE`).
 
 ### Fixed
 
+- **Conditional fields decoded wrong-and-confident on Prime.** A field whose
+  resolution/unit depends on another field's bit (common in proprietary
+  marine PGNs) has no §2 expression, and `n2k.py` computed a value from the
+  one encoded variant — e.g. 2.5× off with the wrong unit, silently. Now such
+  a field must be marked `Undecodable` and `n2k` renders it not-available
+  (`n/d`) rather than a plausible wrong number. Wrong-and-confident is worse
+  than absent; the real decode is a schema proposal (`TABLES.md` §8).
 - **`tables/validate.py` — two confident-wrong-reading holes closed.**
   `Resolution: 0` was silently coerced to `1` (`float(x or 1)`); a real-table
   typo would then decode as raw counts and look plausible — it is now a

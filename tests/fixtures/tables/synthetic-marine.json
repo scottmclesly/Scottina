@@ -74,8 +74,7 @@
             "0": "SYN-Alpha",
             "1": "SYN-Bravo",
             "2": "SYN-Charlie",
-            "14": "SYN-Error",
-            "15": "SYN-NotAvail"
+            "14": "SYN-Error"
           }
         },
         {
@@ -100,7 +99,8 @@
           "BitLength": 16,
           "Resolution": 0.1,
           "Signed": false,
-          "Units": "SYN-pct"
+          "Units": "SYN-pct",
+          "Undecodable": "resolution/unit depends on SYN Select bit 1; §2 cannot express a conditional field"
         }
       ],
       "TransmissionInterval": 100
@@ -177,8 +177,7 @@
             "0": "SYN-Alpha",
             "1": "SYN-Bravo",
             "2": "SYN-Charlie",
-            "14": "SYN-Error",
-            "15": "SYN-NotAvail"
+            "14": "SYN-Error"
           }
         },
         {
@@ -203,7 +202,8 @@
           "BitLength": 16,
           "Resolution": 0.1,
           "Signed": false,
-          "Units": "SYN-pct"
+          "Units": "SYN-pct",
+          "Undecodable": "resolution/unit depends on SYN Select bit 1; §2 cannot express a conditional field"
         }
       ],
       "TransmissionInterval": 100
@@ -368,8 +368,7 @@
             "0": "SYN-Alpha",
             "1": "SYN-Bravo",
             "2": "SYN-Charlie",
-            "14": "SYN-Error",
-            "15": "SYN-NotAvail"
+            "14": "SYN-Error"
           }
         },
         {

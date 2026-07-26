@@ -90,48 +90,76 @@ class TestPrimeDecodeMatchesGroundTruth(unittest.TestCase):
         self.assertGreater(checked, 500)      # the run really is exercised
 
     def test_not_available_sentinels_decode_to_none(self):
-        # manufacturer 2047, category 15, signed 0x7F, wide-flag all-ones all
-        # decode NA — the sentinel collisions the shape test exists to surface
+        # signed 0x7F and a wide flag's all-ones both decode NA — the all-ones
+        # sentinel collisions the shape test exists to surface
         na_seen = set()
         for r in self.golden:
             for name, v in r["fields"].items():
                 if v is None:
                     na_seen.add(name)
-        for expect_na in ("SYN Manufacturer ID", "SYN Signed Level",
-                          "SYN Category", "SYN Mode Flags"):
+        for expect_na in ("SYN Signed Level", "SYN Mode Flags",
+                          "SYN Status Flags"):
             self.assertIn(expect_na, na_seen)
 
+    def test_manufacturer_2046_decodes_as_a_real_value(self):
+        # 2046 (0x7FE) is unassigned but NOT all-ones, so it is a real value —
+        # the correction from 2047, which collided with the NA sentinel
+        for r in self.golden:
+            if "SYN Manufacturer ID" in r["fields"]:
+                self.assertEqual(r["fields"]["SYN Manufacturer ID"], 2046)
+                rec = self.dec.feed(r["t"], r["id"], True,
+                                    bytes.fromhex(r["raw"]))
+                mi = {f["name"]: f for f in rec["fields"]}["SYN Manufacturer ID"]
+                self.assertEqual(mi["value"], 2046)
+                return
+        self.fail("no Manufacturer ID field in golden")
 
-class TestConditionalFieldDivergence(unittest.TestCase):
+    def test_lookup_cannot_claim_all_ones(self):
+        # a lookup label at a field's all-ones value is shadowed by the NA
+        # sentinel — correct behaviour, documented so no one adds one
+        f = {"name": "x", "bit_offset": 0, "bit_length": 4, "resolution": 1,
+             "offset": 0, "signed": False, "units": "",
+             "lookup": {"15": "SHOULD-NOT-RENDER"}, "undecodable": None}
+        raw, value, disp = n2k.extract_field((0x0F).to_bytes(1, "little"), f)
+        self.assertEqual((raw, value, disp), (15, None, "—"))   # NA, not label
+
+
+class TestConditionalFieldFailsafe(unittest.TestCase):
     """Field 11's meaning depends on another field's bit — §2 cannot express
-    it. The test documents the divergence rather than hiding it."""
+    it. The fail-safe: n2k must render it not-available with a reason, NEVER a
+    confident wrong number. (The §2 proposal to actually decode it is in
+    TABLES.md.)"""
 
-    def test_select_bit_reScales_beyond_the_table(self):
+    def test_conditional_field_renders_undecodable_not_a_number(self):
         tables, _ = validate.validate_file(MARINE)
         dec = n2k.Decoder(tables)
-        divergent = 0
+        checked = 0
         for r in _golden():
             if "cond" not in r:
                 continue
+            checked += 1
+            self.assertIsNone(r["fields"]["SYN Scaled Value"])   # ground truth
             rec = dec.feed(r["t"], r["id"], True, bytes.fromhex(r["raw"]))
-            got = {f["name"]: f["value"] for f in rec["fields"]}
-            c = r["cond"]
-            # what the table decodes always equals n2k (the table variant)
-            self.assertEqual(_eq(got["SYN Scaled Value"], c["table"]["value"]),
-                             True)
-            if c["select_bit"] == 1 and c["table"]["value"] not in (None, 0):
-                divergent += 1
-                # the true (rpm) meaning is 0.25/0.1 = 2.5x the table (pct)
-                self.assertAlmostEqual(
-                    c["intended"]["value"] / c["table"]["value"], 2.5, places=6)
-                self.assertNotEqual(c["intended"]["unit"], c["table"]["unit"])
-        self.assertGreater(divergent, 0, "no Select=1 divergence in golden")
+            sv = {f["name"]: f for f in rec["fields"]}["SYN Scaled Value"]
+            self.assertIsNone(sv["value"])          # never a number
+            self.assertEqual(sv["disp"], "n/d")     # distinct from NA "—"
+            self.assertIn("condition", sv["undecodable"].lower())  # a reason
+            self.assertEqual(sv["units"], "")       # no misleading unit
+        self.assertGreater(checked, 0)
 
-
-def _eq(a, b):
-    if a is None or b is None:
-        return a is b or a == b
-    return abs(a - b) < 1e-6
+    def test_golden_documents_both_intended_meanings(self):
+        # documentation only (not an n2k assertion): a conditional-aware schema
+        # would decode 0.1 SYN-pct (bit0) or 0.25 SYN-rpm (bit1) — 2.5x apart
+        seen = 0
+        for r in _golden():
+            c = r.get("cond")
+            if not c or c["if_bit0"]["value"] in (None, 0):
+                continue
+            seen += 1
+            self.assertAlmostEqual(
+                c["if_bit1"]["value"] / c["if_bit0"]["value"], 2.5, places=6)
+            self.assertNotEqual(c["if_bit1"]["unit"], c["if_bit0"]["unit"])
+        self.assertGreater(seen, 0)
 
 
 class TestSafetyEnvelope(unittest.TestCase):

@@ -60,6 +60,11 @@ def extract_field(payload, f):
         return None
     raw = (int.from_bytes(payload, "little") >> f["bit_offset"]) \
         & ((1 << n) - 1)
+    if f.get("undecodable"):
+        # fail-safe (TABLES.md §2): the schema cannot correctly interpret this
+        # field, so never compute a number from the wrong resolution — render
+        # not-available. Wrong-and-confident is worse than absent.
+        return raw, None, "n/d"
     if is_na(raw, n, f["signed"]):
         return raw, None, "—"
     sval = raw - (1 << n) if f["signed"] and raw & (1 << (n - 1)) else raw
@@ -213,8 +218,12 @@ class Decoder:
             if got is None:
                 continue
             raw, value, disp = got
-            fields.append({"name": f["name"], "raw": raw, "value": value,
-                           "disp": disp, "units": f["units"]})
+            rec = {"name": f["name"], "raw": raw, "value": value,
+                   "disp": disp, "units": "" if f.get("undecodable")
+                   else f["units"]}
+            if f.get("undecodable"):
+                rec["undecodable"] = f["undecodable"]   # reason, for the screen
+            fields.append(rec)
         return {"ts": ts, "pgn": pgn, "src": src, "name": entry["name"],
                 "fields": fields}
 

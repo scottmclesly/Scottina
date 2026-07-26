@@ -137,28 +137,35 @@ M_FAST = _pgn(0xFC, 0)                     # fast-packet → excluded from index
 M_PDU1 = _pgn(0x11, 0)                     # PF 0x11 < 240 → PDU1 → excluded
 MARINE_ELIGIBLE = list(_MF)
 
-# 2047 = 0x7FF: an UNASSIGNED manufacturer code AND the all-ones 11-bit value,
-# so it doubly cannot present as a real manufacturer (§2 decodes it as NA).
-MANUFACTURER_ID = 2047
-# Category lookup. Note 15 (0xF) is the all-ones 4-bit NA sentinel, so its
-# label is shadowed by the not-available rule — see NOTES / gap report.
+# 2046 = 0x7FE: unassigned, and NOT the all-ones 11-bit sentinel — so it
+# decodes as a real value, not not-available. (2047/0x7FF would collide with
+# the NA sentinel; the shadowing of all-ones is a separate, tested fact.)
+MANUFACTURER_ID = 2046
+# Category lookup. No label at 15 (0xF): that is the all-ones 4-bit NA
+# sentinel, which decodes not-available regardless — a lookup cannot claim
+# all-ones. Kept as a tested fact, not a gap. 14 (0xE) is a normal enum.
 CATEGORY_LOOKUP = {"0": "SYN-Alpha", "1": "SYN-Bravo", "2": "SYN-Charlie",
-                   "14": "SYN-Error", "15": "SYN-NotAvail"}
+                   "14": "SYN-Error"}
 
 
-def _mf(name, off, ln, res=1, signed=False, units="", lookup=None):
+def _mf(name, off, ln, res=1, signed=False, units="", lookup=None,
+        undecodable=None):
     f = {"Name": name, "BitOffset": off, "BitLength": ln,
          "Resolution": res, "Signed": signed, "Units": units}
     if lookup:
         f["Lookup"] = lookup
+    if undecodable:
+        f["Undecodable"] = undecodable
     return f
 
 
 def _feedback_fields():
     """SYN Feedback A/B — the shape test, EXACTLY 64 bits (payload-fit
-    boundary). Field 11 is conditional: §2 can encode only one variant."""
+    boundary). Field 11 is conditional; §2 cannot express that, so it is
+    marked Undecodable — n2k renders it not-available rather than a
+    known-wrong value (the fail-safe)."""
     return [
-        _mf("SYN Manufacturer ID", 0, 11),        # fixed 2047 (= NA sentinel)
+        _mf("SYN Manufacturer ID", 0, 11),        # fixed 2046 (unassigned)
         _mf("SYN Reserved 1", 11, 2),
         _mf("SYN Industry Group", 13, 3),
         _mf("SYN Source Instance", 16, 4),
@@ -168,10 +175,12 @@ def _feedback_fields():
         _mf("SYN Category", 32, 4, lookup=CATEGORY_LOOKUP),
         _mf("SYN Reserved 2", 36, 4),
         _mf("SYN Signed Level", 40, 8, signed=True),   # -100..100, NA 0x7F
-        # conditional: §2 can only carry ONE (res,unit). Encoded variant =
-        # Select bit1==0 (0.1 SYN-pct); the Select bit1==1 meaning (0.25
-        # SYN-rpm) is unrepresentable — the emitter records the divergence.
-        _mf("SYN Scaled Value", 48, 16, res=0.1, units="SYN-pct"),
+        # conditional: the real (resolution, unit) depends on SYN Select bit 1
+        # (0.1 SYN-pct when clear, 0.25 SYN-rpm when set). §2 cannot express
+        # that, so the field is Undecodable — never a confident wrong number.
+        _mf("SYN Scaled Value", 48, 16, res=0.1, units="SYN-pct",
+            undecodable="resolution/unit depends on SYN Select bit 1; "
+                        "§2 cannot express a conditional field"),
     ]
 
 
@@ -290,6 +299,10 @@ def _selfcheck(name, obj):
         fa = tables[MF_A]["fields"]
         assert len(fa) == 11                                  # nothing dropped
         assert fa[-1]["bit_offset"] + fa[-1]["bit_length"] == 64  # boundary
+        assert fa[-1]["undecodable"]                          # conditional field
+        assert fa[0]["name"] == "SYN Manufacturer ID"
+        cat = tables[MF_A]["fields"][7]["lookup"] or {}
+        assert "15" not in cat                                # no all-ones label
         assert tables[MUNK]["interval_ms"] is None            # lower-bound path
         assert any(f["lookup"] for f in tables[MENU]["fields"])
     return tables, warns

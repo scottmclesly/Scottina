@@ -16,9 +16,9 @@ decoder are verified **numerically**, against ground truth, rather than by eye.
 - Every PGN is in **reserved data page 3** (`pgn >> 16 == 3`); no real
   NMEA2000/J1939 device transmits or acts on this range. The emitter
   **asserts** this on every id it builds — a comment is not enforcement.
-- **Manufacturer ID is 2047 (0x7FF)** — unassigned, so it cannot be mistaken
-  for any vendor. (It is also the all-ones 11-bit value, so §2 decodes it as
-  not-available — doubly incapable of presenting as a real manufacturer.)
+- **Manufacturer ID is 2046 (0x7FE)** — unassigned, so it cannot be mistaken
+  for any vendor. (2047/0x7FF would be the all-ones NA sentinel and decode as
+  not-available; 2046 is a real value, deliberately just below it.)
 - **No actuation semantics** anywhere — no gear/throttle/trim/helm/steering in
   any field name, unit, or enum label. `SYN-` neutral names throughout.
 - Emitter **refuses to transmit** without `--bench-bus-confirmed` and prints
@@ -52,37 +52,41 @@ both exist in the table purely for index-exclusion tests.
 
 Verified by decoding synthetic-marine with `kilodash/n2k.py`:
 
-1. **Conditional field — GAP.** `SYN Feedback A` field 11 (`SYN Scaled Value`)
-   is meant to mean `0.1 SYN-pct` when `SYN Select` bit 1 is clear and
-   `0.25 SYN-rpm` when set. §2 carries exactly one `(Resolution, Units)` per
-   field, so it **cannot express** the condition. The table encodes the pct
-   variant; n2k decodes every frame as pct. For Select-bit-1 frames the true
-   value is **2.5× the decoded value with the wrong unit**. The emitter records
-   both in each frame's `cond` block; `test_syn_emitter.py` asserts the
-   divergence rather than hiding it. **A consumer cannot decode this field
-   correctly from §2 alone** — Light must special-case it or the table must be
-   split into two conditional PGNs.
+1. **Conditional field — was a live correctness bug, now FAIL-SAFED.**
+   `SYN Feedback A` field 11 (`SYN Scaled Value`) means `0.1 SYN-pct` when
+   `SYN Select` bit 1 is clear and `0.25 SYN-rpm` when set. §2 carries exactly
+   one `(Resolution, Units)` per field, so it **cannot express** the condition —
+   and a naïve decode produced a **2.5×-wrong value with the wrong unit**,
+   silently and plausibly, for any real table using this common pattern. Fixed:
+   the field is marked `Undecodable` (§2) and n2k renders it `n/d` (not a
+   number) with a reason; the emitter's ground truth is `None` and
+   `test_syn_emitter.py` asserts the fail-safe. The `cond` block still
+   documents both intended meanings for reference. The actual §2 extension is
+   **proposed** in `TABLES.md` §8 (recommendation: match Canboat
+   `LOOKUP_FIELDTYPE`).
 
 2. **Per-bit flag semantics — GAP.** §2 has `Lookup` (one-of-N over the whole
    field value) but no notion of named bits. A 4-bit `SYN Mode Flags` field
    decodes as an opaque number 0–15, not `{bit0: …, bit1: …}`. The only
-   faithful encoding of named flags is **one 1-bit field per flag** (as
-   `SYN Flags` does with eight 1-bit fields). Name this before Light builds a
-   flag renderer.
+   faithful encoding of named flags today is **one 1-bit field per flag** (as
+   `SYN Flags` does with eight 1-bit fields). Canboat expresses this natively
+   with `BITLOOKUP` / `LookupBitEnumeration` (TABLES.md §8) — match it if we
+   build a flag renderer.
 
-3. **Not-available sentinel — PRESENT, but collides with real data.** §2/n2k
+3. **Not-available sentinel — PRESENT; a fixed convention, not a bug.** §2/n2k
    reserve the all-ones raw (unsigned) / max-positive (signed) of any field
-   **≥2 bits** as not-available. Confirmed:
-   - `SYN Manufacturer ID` 2047 (all-ones 11-bit) → decodes NA, never 2047;
-   - the `SYN Category` lookup label at `0xF` (`SYN-NotAvail`) is **shadowed** —
-     `0xF` decodes NA `—`, the label never renders. *A lookup entry at a
-     field's all-ones value is unreachable.*
-   - a wide flag field's all-bits-set (`0xF` for 4 bits) → NA, so
-     "all flags set" is **unrepresentable** in a multi-bit flag field;
+   **≥2 bits** as not-available. Consequences (all correct behaviour, now
+   documented by tests rather than filed as gaps):
+   - a **lookup label cannot claim a field's all-ones value** — it is shadowed
+     by NA and never renders (`test_lookup_cannot_claim_all_ones`). This is why
+     `SYN Category` has no `0xF` label and why `SYN Manufacturer ID` uses
+     **2046** (`0x7FE`, a real value), not 2047 (`0x7FF`, the sentinel);
+   - a wide flag field's all-bits-set (`0xF` for 4 bits) decodes NA, so
+     "all flags set" is unrepresentable in a multi-bit flag field (use 1-bit
+     fields — see gap 2);
    - signed 8-bit NA = `0x7F` (127), matching the spec.
-   §2 *has* a NA sentinel, but it is an implicit fixed convention you cannot
-   opt out of (except 1-bit fields) and it silently claims the max value of
-   every field. Worth naming as a constraint, not a bug.
+   The constraint to remember: you cannot store the max value of a ≥2-bit
+   field as real data.
 
 4. **Signedness — PRESENT.** §2 carries `Signed`; two's-complement over
    `BitLength`; signed NA = max-positive. Confirmed (raw 156 → −100, `0x7F` →

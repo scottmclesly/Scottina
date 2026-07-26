@@ -54,14 +54,17 @@ ABSENT_INTERVAL_MS = 1000          # emit rate for a PGN with no table interval
 CAN_EFF_FLAG = 0x80000000
 
 # Fields with a fixed content value (raw counts).
-FIXED = {"SYN Manufacturer ID": 2047,   # 0x7FF: unassigned AND all-ones ⇒ NA
+FIXED = {"SYN Manufacturer ID": 2046,   # 0x7FE: unassigned, NOT the NA sentinel
          "SYN Reserved 1": 3, "SYN Industry Group": 4, "SYN Reserved 2": 0xF}
 # Fields swept by decoded VALUE (rather than raw), including edges/NA (None).
 EDGE_VALUES = {"SYN Signed Level": [-100, 0, 100, None]}
-# The conditional field §2 cannot express: when the Select field's bit 1 is
-# set the real meaning is (0.25, SYN-rpm); the table carries only (0.1,
-# SYN-pct). {pgn_name-independent: (alt_res, alt_unit, select_field, bit)}.
-CONDITIONAL = {"SYN Scaled Value": (0.25, "SYN-rpm", "SYN Select", 1)}
+# The conditional field. The table marks it Undecodable (n2k renders it
+# not-available), so its ground-truth value is None; the emitter still records
+# what a conditional-aware schema WOULD yield under each Select state, as
+# documentation for the §2 proposal. (pct_res, pct_unit, rpm_res, rpm_unit,
+# selector_field, selector_bit).
+CONDITIONAL = {"SYN Scaled Value":
+               (0.1, "SYN-pct", 0.25, "SYN-rpm", "SYN Select", 1)}
 
 
 # ----------------------------------------------------------------- decode --
@@ -144,19 +147,22 @@ def build_frame(entry, src, k, seed):
         acc |= (raw & ((1 << f["bit_length"]) - 1)) << f["bit_offset"]
     data = acc.to_bytes(8, "little")
     for f in entry["fields"]:
-        gt_fields[f["name"]] = expected_value(f, raws[f["name"]])
+        # an Undecodable field never carries a value — mirrors the n2k
+        # fail-safe, so the golden test asserts absence, not a wrong number.
+        gt_fields[f["name"]] = (None if f.get("undecodable")
+                                else expected_value(f, raws[f["name"]]))
         if f["name"] in CONDITIONAL:
-            alt_res, alt_unit, sel_name, sel_bit = CONDITIONAL[f["name"]]
+            pres, punit, rres, runit, sel_name, sel_bit = CONDITIONAL[f["name"]]
             bit = (raws.get(sel_name, 0) >> sel_bit) & 1
-            table_val = gt_fields[f["name"]]      # what §2 / the table decodes
-            # NA (sentinel raw) is NA under either scale; only a real value
-            # re-scales when Select bit 1 is set.
-            intended = (raws[f["name"]] * alt_res
-                        if (bit and table_val is not None) else table_val)
-            cond = {"field": f["name"], "select_bit": bit,
-                    "table": {"value": table_val, "unit": f["units"]},
-                    "intended": {"value": intended,
-                                 "unit": alt_unit if bit else f["units"]}}
+            r = raws[f["name"]]
+            na = is_na(r, f["bit_length"], f["signed"])
+            # documentation only: what a conditional-aware schema would yield
+            # under each Select state. n2k (and gt above) render undecodable.
+            b0 = None if na else r * pres
+            b1 = None if na else r * rres
+            cond = {"field": f["name"], "select_bit": bit, "decoded": None,
+                    "if_bit0": {"value": b0, "unit": punit},
+                    "if_bit1": {"value": b1, "unit": runit}}
     pgn = entry["pgn"]
     gt = {"pgn": pgn, "src": src, "id": arb_id(pgn, src), "dlc": 8,
           "raw": data.hex(), "fields": gt_fields}

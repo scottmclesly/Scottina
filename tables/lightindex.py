@@ -67,12 +67,18 @@ def build_detail(entry):
          "fast": bool(entry.get("fast"))}
     if entry.get("interval_ms") is not None:
         d["interval_ms"] = entry["interval_ms"]
-    d["fields"] = [
-        {"name": f["name"], "bit_offset": f["bit_offset"],
+    d["fields"] = [_detail_field(f) for f in entry["fields"]]
+    return d
+
+
+def _detail_field(f):
+    d = {"name": f["name"], "bit_offset": f["bit_offset"],
          "bit_length": f["bit_length"], "resolution": f["resolution"],
          "offset": f["offset"], "signed": f["signed"],
          "units": f["units"], "lookup": f["lookup"]}
-        for f in entry["fields"]]
+    if f.get("undecodable"):
+        # the consumer must fail-safe this field too (§2) — carry the reason
+        d["undecodable"] = f["undecodable"]
     return d
 
 
@@ -88,7 +94,9 @@ def _index_entry(entry, detail_sha=None):
     sig = []
     for i, f in enumerate(entry["fields"]):
         s = {"i": i, "n": f["name"]}
-        if f["units"]:
+        # an undecodable field's unit is meaningless — omit it so the picker
+        # shows the signal name without a wrong unit (it can still list it).
+        if f["units"] and not f.get("undecodable"):
             s["u"] = f["units"]
         sig.append(s)
     e["sig"] = sig

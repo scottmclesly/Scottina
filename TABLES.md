@@ -61,8 +61,10 @@ noted.
           "Offset": 0,                // engineering offset, default 0
           "Signed": false,            // default false
           "Units": "V",               // default ""
-          "Lookup": {"0": "Off"}      // or Canboat "EnumValues":
+          "Lookup": {"0": "Off"},     // or Canboat "EnumValues":
                                       //   [{"name": "Off", "value": "0"}]
+          "Undecodable": "reason"     // optional; §2 can't interpret this
+                                      //   field → decoders render it n/a
         }
       ]
     }
@@ -103,6 +105,16 @@ two-tier: the offending field is skipped with a warning, the rest load):
   skipped. Fast-packet PGNs assemble a larger payload and are exempt. Checked
   in `tables/validate.py` (the shared gate) so it protects every consumer —
   Prime's live decode and the Light export alike — not just one of them.
+
+`Undecodable` (optional, string) is the **fail-safe** for a field the current
+schema cannot correctly interpret — the common case is a *conditional field*
+whose resolution/unit depends on another field's value (see §8). A decoder
+**must not compute a number** for such a field: it renders it not-available
+(the NMEA2K screen shows `n/d`, distinct from the `—` NA sentinel) and carries
+the reason for display. **Wrong-and-confident is worse than absent.** The
+field still occupies its bits (its raw value is available) and its
+`Undecodable` flag travels into the §5c detail file so Light fail-safes it
+too; the §5b index omits its (meaningless) unit but still lists the signal.
 
 Validation is **two-tier**: a malformed *file* (not JSON, no usable `PGNs`)
 is rejected outright; a malformed *entry* (bad field, missing `PGN`) is
@@ -286,3 +298,63 @@ never read the inbox.
 
 Changing anything in §1–§6 means updating **all** of the above in one
 change, or not making the change.
+
+## 8. Open proposal — conditional fields (NOT yet in the schema)
+
+**Problem.** Proprietary marine PGNs commonly carry a field whose meaning —
+resolution *and* unit, sometimes the field type itself — depends on another
+field's value or a single bit (a "mode"/"select"). §2 gives each field exactly
+one `Resolution` and one `Units`, so it cannot express this. Today such a field
+is marked `Undecodable` (§2) and rendered not-available: correct and safe, but
+it means the value is simply unavailable. This section proposes how to actually
+decode it. It is a **proposal — not implemented.** `Undecodable` is the
+shipped fail-safe until one of these lands.
+
+**Does §2 already let `Units` vary independently of `Resolution`? No.** Each
+field has one static `Units` and one static `Resolution`; neither varies at
+runtime, and there is no mechanism to change one without the other. A `Lookup`
+substitutes a label for the numeric render but does not vary units. So this is
+**one gap, not two**: a conditional field switches its *whole* numeric
+interpretation (resolution and unit together — e.g. `0.1 %` ↔ `0.25 rpm`), and
+the fix should switch them as a unit, not add two independent knobs.
+
+**What Canboat does (checked `docs/canboat.xsd` before inventing a shape).**
+Canboat already has conventions for exactly this, and we should match rather
+than diverge:
+
+- **`LookupFieldTypeEnumeration`** (`FieldType = LOOKUP_FIELDTYPE`): a
+  selector field whose value "defines the field type of a following variable
+  field". This is the closest match to the mode→(resolution,unit) case — the
+  selector picks the *type* (hence resolution + unit) of the next field.
+- **`LookupIndirectEnumeration`** / `…FieldOrder` (`EnumTriplet` with
+  `Value1`/`Value2`): a field's lookup meaning depends on another field's
+  value, referenced by field order.
+- **`Condition`**: a field may or may not be present depending on a condition.
+- **`Match`** + **`Fallback`**: proprietary PGN *variants* share a PGN number;
+  the decoder picks the entry whose `Match` fields all match (manufacturer
+  code, etc.). This is the "variants keyed by a selector" approach, at PGN
+  granularity.
+- (Related, for the separate per-bit-flag gap: **`LookupBitEnumeration`** /
+  `FieldType = BITLOOKUP`, `BitPair`/`Bit` — named bits. If we tackle flags,
+  match this too.)
+
+**Three options, with what each costs Light:**
+
+| Option | Shape | Index (§5b) size | Parser complexity | Picker w/o evaluating conditions |
+|---|---|---|---|---|
+| **1. Per-field `condition`** — `{selector_field, bit, value}` on the field with a small table of per-condition `(resolution, units)` | one field entry + a compact condition block | small: +~1 selector ref +N×(res,unit) per conditional field | must read the selector field first, then pick the variant — a two-pass decode within one PGN | yes — the picker lists the field by name; only the live unit/value needs the selector |
+| **2. Field variants keyed by a selector** (à la Canboat `Match`, but per field) — N full field definitions, one per selector value | N field entries (or a variant sub-array) | larger: ~N× the field's detail | pick the matching variant by selector; each variant is an ordinary field | yes for names; the picker would show N rows or one merged row (a UI choice) |
+| **3. Match Canboat `LOOKUP_FIELDTYPE`** — a selector field whose value maps to a field *type* that carries (resolution, unit) | selector lookup + a type table | medium; reuses Canboat's type catalogue if we adopt it | Canboat-level (moderate) but a known, documented model; interop with Canboat tables for free | yes — name lists without evaluation; unit is "varies until decoded" |
+
+**Recommendation.** Option 3 (match Canboat `LOOKUP_FIELDTYPE`) is preferred:
+it is the upstream convention, so vendor tables that already use it import
+without a translation layer, and it keeps §2 a *subset* of Canboat rather than
+a divergent dialect. Option 1 is the cheapest to ship if we only ever need the
+narrow bit→(res,unit) case and want the smallest index. Option 2 is simplest to
+parse but the heaviest on index size — poor for Light's 192 KB budget.
+
+**In all three, the picker can still show a signal list without evaluating any
+condition** — the field *name* is static; only the unit/value is deferred to
+decode time. So Light's browse experience is unaffected; only live rendering of
+a conditional field needs the selector. Until a decision lands, `Undecodable`
+keeps those fields safe (not-available, never wrong).

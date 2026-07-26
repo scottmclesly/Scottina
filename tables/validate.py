@@ -113,6 +113,18 @@ def _norm_field(fld):
         # decode as raw counts and look entirely plausible — reject it.
         raise ValueError(f"field {name!r}: Resolution 0 is not a valid scale")
     units = fld.get("Units", "")
+    # `Undecodable` (TABLES.md §2): the fail-safe for a field the current
+    # schema cannot correctly interpret (e.g. a conditional field whose
+    # resolution/unit depends on another field's value). A truthy string is
+    # the reason; `true` gets a default. Decoders MUST render it not-available
+    # — wrong-and-confident is worse than absent.
+    u = fld.get("Undecodable")
+    if isinstance(u, str) and u.strip():
+        undecodable = u.strip()
+    elif u is True:
+        undecodable = "not decodable under the current schema"
+    else:
+        undecodable = None
     return {
         "name": name.strip(),
         "bit_offset": bit_offset,
@@ -122,6 +134,7 @@ def _norm_field(fld):
         "signed": bool(fld.get("Signed", False)),
         "units": str(units) if units is not None else "",
         "lookup": _norm_lookup(fld),
+        "undecodable": undecodable,
     }
 
 

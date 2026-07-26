@@ -94,6 +94,16 @@ class TestExtract(unittest.TestCase):
         self.assertEqual((raw, disp), (2, "Apparent"))
         self.assertIsNone(n2k.extract_field(b"\x20", self.F(bit_offset=8)))
 
+    def test_undecodable_never_yields_a_number(self):
+        # the §2 fail-safe: a field the schema cannot interpret decodes to
+        # not-available (never a value from the wrong resolution)
+        f = self.F(bit_length=16, resolution=0.1, units="pct",
+                   undecodable="depends on another field's bit")
+        raw, value, disp = n2k.extract_field(b"\x64\x00\x00", f)
+        self.assertEqual(raw, 100)          # raw is still available
+        self.assertIsNone(value)            # but no computed number
+        self.assertEqual(disp, "n/d")       # distinct from NA "—"
+
 
 def fp_frames(seq, payload):
     """Build fast-packet frames for an assembled payload."""
