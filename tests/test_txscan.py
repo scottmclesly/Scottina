@@ -13,11 +13,22 @@ are each named with their justification. The per-module RX-only scans in
 tests/test_busmon.py / test_n2k.py remain as the independent reject pass.
 
 Separately, **bench equipment** under `tools/bench/` is NOT Scottina runtime
-and may transmit — it is a shell/harness generator, gated behind
-`--bench-bus-confirmed`, and no Scottina package imports or constructs its
-frames (enforced by tests/test_syn_emitter.py). Such files are named in
-BENCH_CAN_TX, kept apart from the runtime carve-out so the "what Scottina may
-put on the bus" answer stays exactly (1)+(2).
+and may transmit — a human runs it against a bench bus on purpose, and no
+Scottina package imports it or constructs its frames (the emitter boundary is
+enforced by tests/test_syn_emitter.py). The synthetic emitter is additionally
+gated behind `--bench-bus-confirmed`; the SPECTER rigs are gated by taking the
+interface as a required argument. Such files are named in BENCH_CAN_TX, kept
+apart from the runtime carve-out so the "what Scottina may put on the bus"
+answer stays exactly (1)+(2).
+
+The SPECTER simulator is additionally reachable from the panel: the SPECTER
+tile's NODE button starts and stops `specter-sim.service`. That is a control,
+not a TX path — the screen builds no frame and holds no CAN socket, and the
+scan below still rejects any send-shaped call in it. The operator-only
+property is what makes this safe rather than a back door, so
+TestSpecterSimServiceIsOperatorOnly makes it executable: the unit carries no
+[Install] section, so nothing can enable it and a reboot never puts the bench
+node on the bus.
 
 Run from the repo root:  python -m unittest discover -s tests
 """
@@ -43,7 +54,9 @@ ALLOWED_CAN_TX = {
 # (tests/test_syn_emitter.py enforces that boundary). Kept apart from
 # ALLOWED_CAN_TX so the runtime answer stays exactly the two carve-outs.
 BENCH_CAN_TX = {
-    "tools/bench/syn-emitter.py",   # synthetic ground-truth emitter
+    "tools/bench/syn-emitter.py",     # synthetic ground-truth emitter
+    "tools/bench/specter_sim.py",     # SPECTER bench node simulator
+    "tools/bench/specter_tile.py",    # terminal tile wrapping the simulator
 }
 
 # Modules permitted send-family calls on NON-CAN sockets, each justified.
@@ -138,13 +151,70 @@ class TestTreeWideTxScan(unittest.TestCase):
         list is a scope decision, not a refactor detail."""
         self.assertEqual(ALLOWED_CAN_TX, {"n2k/node.py"})
 
-    def test_bench_tx_is_exactly_the_emitter_and_is_bench_only(self):
+    def test_bench_tx_is_exactly_the_named_rigs_and_is_bench_only(self):
         """Bench TX is separate from the runtime carve-out, and every entry
-        must live under tools/bench/ — never inside a Scottina package."""
-        self.assertEqual(BENCH_CAN_TX, {"tools/bench/syn-emitter.py"})
+        must live under tools/bench/ — never inside a Scottina package.
+
+        The SPECTER pair drives the preflight bench link: the simulator is
+        the boat side (it publishes the node status the Screen expects), and
+        the tile is a terminal display wrapping it. They transmit, so they
+        are bench equipment by definition and are named here rather than
+        anywhere in the runtime. The panel's own SPECTER screen observes the
+        same link and transmits nothing — see tests/test_specterlink.py."""
+        self.assertEqual(BENCH_CAN_TX, {"tools/bench/syn-emitter.py",
+                                        "tools/bench/specter_sim.py",
+                                        "tools/bench/specter_tile.py"})
         for rel in BENCH_CAN_TX:
             self.assertTrue(rel.startswith("tools/bench/"), rel)
             self.assertFalse(rel.startswith("kilodash/"), rel)
+
+
+class TestSpecterSimServiceIsOperatorOnly(unittest.TestCase):
+    """The panel may start the SPECTER bench node; nothing else may.
+
+    The tile's NODE button is a control over a systemd unit, so the safety
+    property is no longer "this screen cannot transmit" alone — it is also
+    "the thing it starts cannot start itself". A unit with no [Install]
+    section cannot be enabled, so no boot, no target and no dependency can
+    put the bench node on the bus. Only a deliberate tap can.
+    """
+
+    UNIT = "setup/specter-sim.service"
+
+    def setUp(self):
+        path = os.path.join(ROOT, self.UNIT)
+        if not os.path.exists(path):
+            self.skipTest("%s not installed in the tree" % self.UNIT)
+        with open(path) as f:
+            self.text = f.read()
+
+    def test_unit_has_no_install_section(self):
+        self.assertNotIn("[Install]", self.text,
+                         "an [Install] section would let systemctl enable "
+                         "the bench node to start at boot")
+        self.assertNotIn("WantedBy", self.text)
+        self.assertNotIn("RequiredBy", self.text)
+
+    def test_unit_runs_the_bench_rig_with_an_explicit_interface(self):
+        """The required-interface gate survives the move into a unit."""
+        self.assertIn("tools/bench/specter_sim.py", self.text)
+        self.assertRegex(self.text, r"specter_sim\.py\s+can\d")
+
+    def test_unit_does_not_restart_itself(self):
+        self.assertIn("Restart=no", self.text,
+                      "a restarting bench node would transmit again after "
+                      "the operator stopped it")
+
+    def test_the_screen_that_starts_it_still_transmits_nothing(self):
+        rel = "kilodash/screens/specter.py"
+        with open(os.path.join(ROOT, rel)) as f:
+            src = f.read()
+        self.assertEqual(scan_source(rel, src), [])
+        tree = ast.parse(src, rel)
+        names = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        names |= {n.id for n in ast.walk(tree) if isinstance(n, ast.Name)}
+        self.assertEqual(names & CAN_MARKERS, set(),
+                         "the SPECTER screen must hold no CAN socket")
 
 
 class TestScanCatches(unittest.TestCase):

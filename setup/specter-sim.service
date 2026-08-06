@@ -1,0 +1,14 @@
+[Unit]
+Description=SPECTER bench node simulator (bench equipment, operator started)
+Documentation=file:/opt/kilodash/tools/bench/README.md
+After=sys-subsystem-net-devices-can0.device
+BindsTo=sys-subsystem-net-devices-can0.device
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/kilodash/tools/bench/specter_sim.py can0
+Restart=no
+StandardInput=null
+StandardOutput=journal
+StandardError=journal
+TimeoutStopSec=8
