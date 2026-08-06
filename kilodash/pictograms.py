@@ -86,6 +86,25 @@ def _can(d, cx, cy, r, c):
         _dot(d, x, y, r * 0.16, c)
 
 
+def _specter(d, cx, cy, r, c):
+    """Two nodes answering each other: opposed arrowheads on one link, with
+    the preflight checklist ticks stacked beside them. The link is the
+    subject, so both directions are drawn — that is the whole tile."""
+    lw = _lw(r)
+    y0, y1 = cy - r * 0.5, cy + r * 0.5
+    a = r * 0.34
+    # upper lane, pointing right; lower lane, pointing left
+    d.line((cx - r, y0, cx + r * 0.75, y0), fill=c, width=lw)
+    d.polygon(((cx + r, y0), (cx + r * 0.75, y0 - a * 0.5),
+               (cx + r * 0.75, y0 + a * 0.5)), fill=c)
+    d.line((cx + r, y1, cx - r * 0.75, y1), fill=c, width=lw)
+    d.polygon(((cx - r, y1), (cx - r * 0.75, y1 - a * 0.5),
+               (cx - r * 0.75, y1 + a * 0.5)), fill=c)
+    # the two endpoints
+    _dot(d, cx - r, y0, r * 0.17, c)
+    _dot(d, cx + r, y1, r * 0.17, c)
+
+
 def _n2k(d, cx, cy, r, c):
     """Decoded gauge over the bus pair: raw wire below, meaning above."""
     lw = _lw(r)
@@ -276,6 +295,7 @@ _GLYPHS = {
     "wifisniff": _wifisniff,
     "can": _can,
     "n2k": _n2k,
+    "specter": _specter,
     "tables": _tables,
     "i2c": _i2c,
     "serial": _serial,

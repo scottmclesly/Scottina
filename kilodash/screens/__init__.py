@@ -10,6 +10,7 @@ from .sdr import SdrScreen
 from .wifisniff import WifiSniffScreen
 from .canbus import CanScreen
 from .n2k import N2kScreen
+from .specter import SpecterScreen
 from .tables import TablesScreen
 from .i2cscan import I2cScreen
 from .serialmon import SerialScreen
@@ -34,6 +35,7 @@ SCREENS = [
     WifiSniffScreen,     # device: wifisniff (ALFA)
     CanScreen,           # device: can (raw-bus forensics)
     N2kScreen,           # device: can (semantic decode from PGN tables)
+    SpecterScreen,       # device: can (preflight bench link, both directions)
     I2cScreen,           # device: i2c
     SerialScreen,        # device: serial
     LogicScreen,         # device: la (FX2LP logic analyzer)

@@ -13,11 +13,13 @@ are each named with their justification. The per-module RX-only scans in
 tests/test_busmon.py / test_n2k.py remain as the independent reject pass.
 
 Separately, **bench equipment** under `tools/bench/` is NOT Scottina runtime
-and may transmit — it is a shell/harness generator, gated behind
-`--bench-bus-confirmed`, and no Scottina package imports or constructs its
-frames (enforced by tests/test_syn_emitter.py). Such files are named in
-BENCH_CAN_TX, kept apart from the runtime carve-out so the "what Scottina may
-put on the bus" answer stays exactly (1)+(2).
+and may transmit — a human runs it against a bench bus on purpose, and no
+Scottina package imports it or constructs its frames (the emitter boundary is
+enforced by tests/test_syn_emitter.py). The synthetic emitter is additionally
+gated behind `--bench-bus-confirmed`; the SPECTER rigs are gated by taking the
+interface as a required argument and by being run by hand. Such files are
+named in BENCH_CAN_TX, kept apart from the runtime carve-out so the "what
+Scottina may put on the bus" answer stays exactly (1)+(2).
 
 Run from the repo root:  python -m unittest discover -s tests
 """
@@ -43,7 +45,9 @@ ALLOWED_CAN_TX = {
 # (tests/test_syn_emitter.py enforces that boundary). Kept apart from
 # ALLOWED_CAN_TX so the runtime answer stays exactly the two carve-outs.
 BENCH_CAN_TX = {
-    "tools/bench/syn-emitter.py",   # synthetic ground-truth emitter
+    "tools/bench/syn-emitter.py",     # synthetic ground-truth emitter
+    "tools/bench/specter_sim.py",     # SPECTER bench node simulator
+    "tools/bench/specter_tile.py",    # terminal tile wrapping the simulator
 }
 
 # Modules permitted send-family calls on NON-CAN sockets, each justified.
@@ -138,10 +142,19 @@ class TestTreeWideTxScan(unittest.TestCase):
         list is a scope decision, not a refactor detail."""
         self.assertEqual(ALLOWED_CAN_TX, {"n2k/node.py"})
 
-    def test_bench_tx_is_exactly_the_emitter_and_is_bench_only(self):
+    def test_bench_tx_is_exactly_the_named_rigs_and_is_bench_only(self):
         """Bench TX is separate from the runtime carve-out, and every entry
-        must live under tools/bench/ — never inside a Scottina package."""
-        self.assertEqual(BENCH_CAN_TX, {"tools/bench/syn-emitter.py"})
+        must live under tools/bench/ — never inside a Scottina package.
+
+        The SPECTER pair drives the preflight bench link: the simulator is
+        the boat side (it publishes the node status the Screen expects), and
+        the tile is a terminal display wrapping it. They transmit, so they
+        are bench equipment by definition and are named here rather than
+        anywhere in the runtime. The panel's own SPECTER screen observes the
+        same link and transmits nothing — see tests/test_specterlink.py."""
+        self.assertEqual(BENCH_CAN_TX, {"tools/bench/syn-emitter.py",
+                                        "tools/bench/specter_sim.py",
+                                        "tools/bench/specter_tile.py"})
         for rel in BENCH_CAN_TX:
             self.assertTrue(rel.startswith("tools/bench/"), rel)
             self.assertFalse(rel.startswith("kilodash/"), rel)
