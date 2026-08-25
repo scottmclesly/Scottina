@@ -58,6 +58,7 @@ Use: python3 specter_sim.py can0
 import argparse
 import errno
 import glob
+import math
 import os
 import select
 import signal
@@ -108,6 +109,8 @@ try:
         encode_status_frame,
         step_name,
     )
+    from specter_pkg.tocan_codec import encode_raw as encode_raw_tocan
+    from specter_pkg.tocan_ids import ToCanTid
     from specter_pkg.tocan_ids import (
         DISPLAY_CAN_SOURCE,
         SPECTER_NODE_CAN_SOURCE,
@@ -175,6 +178,46 @@ SHORE_LINK_SLOT = 13
 TX_PERIOD_S = 0.2
 STALE_LIMIT_S = 3.0
 
+# --------------------------------------------------------------------------
+# Vessel telemetry.
+# --------------------------------------------------------------------------
+# THESE FRAMES MUST BE INDISTINGUISHABLE FROM THE VESSEL'S. Same TID, same
+# source, same byte layout, same scale. If the bench and the vessel differ in
+# any way, the bench proves nothing.
+#
+# Source addresses. BEN_TOCAN_IDS.md gives the transmitter for both as the
+# device CLASS, "ToCAN device", not a specific address. The device list in
+# BEN_TOCAN_SOURCE_IDS.md assigns Yanmar 0x82 (engine) and NMEA 0x83. 0x1805
+# is engine feedback, so it is Yanmar; 0x5000 is a sensor, so it is NMEA. The
+# repository already records that pairing in test_tocan_frame.py. Override
+# either one from the console if a bus survey shows different.
+#
+# Period. BEN_TOCAN_IDS.md states "Rate: 1 Hz" for both. That is measured, not
+# guessed. Confirm it against the vessel and correct here if it differs.
+TID_FUEL_LEVEL = 0x5000
+TID_ALTERNATOR_POTENTIAL = 0x1805
+
+NMEA_SOURCE = 0x83
+YANMAR_SOURCE = 0x82
+
+TELEMETRY_PERIOD_S = 1.0
+
+# The scales are NOT repeated here. They come from the shared codec, which
+# takes them from can_node.cpp. One definition of every byte.
+FUEL_PERCENT_MIN = 0.0
+FUEL_PERCENT_MAX = 100.0
+VOLTS_MIN = 10.5
+VOLTS_MAX = 15.0
+
+# The wiggle. Fuel drifts DOWN over minutes, as a tank does. Voltage moves in
+# a narrow band around a charging alternator. Both are bounded, so a long
+# demonstration cannot wander out of a sane range.
+FUEL_DRIFT_PERCENT_PER_SECOND = 0.05
+FUEL_WIGGLE_FLOOR = 15.0
+VOLTS_CENTRE = 14.4
+VOLTS_SWING = 0.35
+VOLTS_PERIOD_S = 45.0
+
 # The result each --refuse-handshake choice returns.
 RESULT_BY_NAME = {
     "accept": int(SpecterHandshakeResult.ACCEPT),
@@ -186,6 +229,10 @@ RESULT_NAMES = {value: name for name, value in
                 ((r.name, int(r)) for r in SpecterHandshakeResult)}
 
 print_lock = threading.Lock()
+
+#: The telemetry the rig transmits. `main()` replaces it with the configured
+#: one. The console reaches it by name, exactly as it reaches the step state.
+TELEMETRY = None
 
 
 def say(text):
@@ -455,6 +502,120 @@ class SimState:
         return data, fields
 
 
+class TelemetryState:
+    """Fuel level and alternator potential, as the vessel sends them.
+
+    The rig holds a physical value. The codec turns it into the raw count the
+    vessel puts on the wire. Nothing here knows a byte layout or a scale.
+    """
+
+    def __init__(self, fuel_percent=78.0, volts=VOLTS_CENTRE, wiggle=True):
+        self.lock = threading.Lock()
+        self.fuel_percent = fuel_percent
+        self.volts = volts
+        self.wiggle = wiggle
+        self.elapsed = 0.0
+        self.fuel_frames = 0
+        self.volt_frames = 0
+
+    def set_fuel(self, percent):
+        """Set the fuel level. It is held inside the plausible range."""
+        with self.lock:
+            self.fuel_percent = max(FUEL_PERCENT_MIN,
+                                    min(FUEL_PERCENT_MAX, float(percent)))
+            return self.fuel_percent
+
+    def set_volts(self, volts):
+        """Set the alternator potential. Held inside the plausible range."""
+        with self.lock:
+            self.volts = max(VOLTS_MIN, min(VOLTS_MAX, float(volts)))
+            return self.volts
+
+    def set_wiggle(self, on):
+        with self.lock:
+            self.wiggle = bool(on)
+            return self.wiggle
+
+    def advance(self, seconds):
+        """Move both values one step. Bounded, so a demonstration is safe."""
+        with self.lock:
+            if not self.wiggle:
+                return
+            self.elapsed += seconds
+            # Fuel drifts down and stops at the floor, so a long demonstration
+            # never runs the tank to empty and never goes negative.
+            self.fuel_percent = max(
+                FUEL_WIGGLE_FLOOR,
+                self.fuel_percent - FUEL_DRIFT_PERCENT_PER_SECOND * seconds)
+            # Voltage swings slowly around the charging value. A sine is
+            # bounded by construction, so it cannot wander.
+            phase = (self.elapsed / VOLTS_PERIOD_S) * 2.0 * math.pi
+            self.volts = VOLTS_CENTRE + VOLTS_SWING * math.sin(phase)
+
+    def snapshot(self):
+        with self.lock:
+            return self.fuel_percent, self.volts, self.wiggle
+
+    def frames(self):
+        """Build both telemetry frames. Return (can_id, data) pairs.
+
+        The raw counts come from the shared codec, so the scale is the one
+        can_node.cpp uses and cannot drift from the display.
+        """
+        fuel_percent, volts, _ = self.snapshot()
+
+        # 0x5000 fuel level: 1/250 percent per bit, unsigned.
+        raw_fuel = int(round(fuel_percent * 250.0))
+        raw_fuel = max(0, min(0xFFFF, raw_fuel))
+
+        # 0x1805 alternator potential: 0.01 V per bit, signed.
+        raw_volts = int(round(volts * 100.0))
+        raw_volts = max(-32768, min(32767, raw_volts))
+
+        with self.lock:
+            self.fuel_frames += 1
+            self.volt_frames += 1
+
+        return (
+            ((TID_FUEL_LEVEL << 8) | NMEA_SOURCE,
+             encode_raw_tocan(TID_FUEL_LEVEL, fuel_level=raw_fuel),
+             fuel_percent, raw_fuel, '%'),
+            ((TID_ALTERNATOR_POTENTIAL << 8) | YANMAR_SOURCE,
+             encode_raw_tocan(TID_ALTERNATOR_POTENTIAL, potential=raw_volts),
+             volts, raw_volts, 'V'),
+        )
+
+
+def telemetry_worker(sock, tx_lock, telemetry, stop_event, link):
+    """Send the two vessel telemetry frames every second.
+
+    This runs with the rig. The panel NODE button starts and stops the unit,
+    so NODE on means the rig transmits, telemetry included, and NODE off means
+    the bus goes quiet. Scottina and a vessel never share a bus, so there is
+    nothing to collide with and no separate flag is needed.
+    """
+    errors = 0
+    last_error_report = 0.0
+    while not stop_event.is_set():
+        telemetry.advance(TELEMETRY_PERIOD_S)
+        for can_id, data, _value, _raw, _unit in telemetry.frames():
+            try:
+                with tx_lock:
+                    send_frame(sock, can_id, data)
+                link['telemetry_tx'] += 1
+            except OSError as error:
+                if error.errno in (errno.EBADF, errno.ENOTCONN, errno.ENODEV):
+                    if not stop_event.is_set():
+                        say('Telemetry TX stopped. Socket error: %s' % error)
+                    return
+                errors += 1
+                now = time.monotonic()
+                if now - last_error_report >= 5.0:
+                    last_error_report = now
+                    say('Telemetry TX error (%d so far): %s' % (errors, error))
+        stop_event.wait(TELEMETRY_PERIOD_S)
+
+
 def open_rx_socket(interface):
     """Open a receive socket. Filter for the two display ids only."""
     sock = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
@@ -702,6 +863,11 @@ HELP_TEXT = "\n".join([
     "  walk              move the first step that is not GOOD one forward",
     "  shore on|off      set the shore link, slot %d. Not a step."
     % SHORE_LINK_SLOT,
+    "  fuel <percent>    set the fuel level, 0 to 100. Example: fuel 42",
+    "  volts <v>         set the alternator potential, %.1f to %.1f"
+    % (VOLTS_MIN, VOLTS_MAX),
+    "  wiggle on|off     drift the telemetry, or hold it steady",
+    "  telemetry         print what is on the wire and at what period",
     "  show              print the state and the next transmit frame",
     "  help              print this text",
     "  quit              stop and close the sockets",
@@ -737,6 +903,32 @@ def show_outgoing(state, reason):
                     STEP_STATES[fields["shore_link"]]))
     lines.append("  cansend form: %08X#%s"
                  % (TX_CAN_ID, "".join("%02X" % b for b in data)))
+    say("\n".join(lines))
+
+
+def show_telemetry(telemetry):
+    """Print what telemetry is on the wire, and at what period.
+
+    Anyone watching the rig can read this and know exactly what the display
+    is being told, and from which address.
+    """
+    fuel_percent, volts, wiggle = telemetry.snapshot()
+    lines = ["-" * 66,
+             "Vessel telemetry. These frames are what the VESSEL sends.",
+             "  period : %.0f ms each, both messages" % (TELEMETRY_PERIOD_S * 1000),
+             "  wiggle : %s" % ("on, values drift" if wiggle
+                                else "off, values held steady")]
+    for can_id, data, value, raw, unit in telemetry.frames():
+        raw_text = " ".join("%02X" % b for b in data)
+        lines.append(
+            "  can_id 0x%06X  tid 0x%04X  source 0x%02X  %8.2f %-1s  "
+            "raw %6d  %s"
+            % (can_id, (can_id >> 8) & 0xFFFF, can_id & 0xFF, value, unit,
+               raw, raw_text))
+    lines.append("  cansend form:")
+    for can_id, data, _v, _r, _u in telemetry.frames():
+        lines.append("    %08X#%s"
+                     % (can_id, "".join("%02X" % b for b in data)))
     say("\n".join(lines))
 
 
@@ -799,6 +991,40 @@ def handle_command(state, stop_event, line):
             show_outgoing(state, "Walk: one step moved forward.")
         else:
             say("Every step in use is GOOD. The veto is clear.")
+        return
+
+    if head == "telemetry":
+        show_telemetry(TELEMETRY)
+        return
+
+    if head == "wiggle":
+        if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
+            say("Use: wiggle on, or wiggle off.")
+            return
+        on = TELEMETRY.set_wiggle(parts[1].lower() == "on")
+        say("Telemetry wiggle is %s." % ("on" if on else "off (held steady)"))
+        show_telemetry(TELEMETRY)
+        return
+
+    if head in ("fuel", "volts"):
+        if len(parts) < 2:
+            say("Use: %s <value>." % head)
+            return
+        try:
+            value = float(parts[1])
+        except ValueError:
+            say("%s needs a number. Got %s." % (head, parts[1]))
+            return
+        if head == "fuel":
+            got = TELEMETRY.set_fuel(value)
+            say("Fuel level set to %.2f %%." % got)
+        else:
+            got = TELEMETRY.set_volts(value)
+            say("Alternator potential set to %.2f V." % got)
+        if TELEMETRY.snapshot()[2]:
+            say("NOTE: the wiggle is on, so this value drifts. "
+                "Use `wiggle off` to hold it.")
+        show_telemetry(TELEMETRY)
         return
 
     if head == "shore":
@@ -872,6 +1098,18 @@ def main():
                              "Bench default 0x%04X." % SPECTER_CHECKLIST_ID)
     parser.add_argument("--duration", type=float, default=0.0,
                         help="Stop after S seconds. 0 means run until quit.")
+    parser.add_argument("--fuel", type=float, default=78.0,
+                        help="Starting fuel level in percent. Default 78.")
+    parser.add_argument("--volts", type=float, default=VOLTS_CENTRE,
+                        help="Starting alternator potential in volts. "
+                             "Default %.1f." % VOLTS_CENTRE)
+    parser.add_argument("--no-wiggle", action="store_true",
+                        help="Hold the telemetry steady instead of drifting "
+                             "it. The gauges then do not move.")
+    parser.add_argument("--no-telemetry", action="store_true",
+                        help="Do not transmit 0x5000 and 0x1805 at all. The "
+                             "gauges go stale, which is the other thing "
+                             "worth showing.")
     parser.add_argument("--walk-period", type=float, default=0.0,
                         help="Move one step forward every S seconds. "
                              "0 means do not walk.")
@@ -911,11 +1149,16 @@ def main():
         "drop_status_after": args.drop_status_after,
     }
 
+    global TELEMETRY
+    TELEMETRY = TelemetryState(fuel_percent=args.fuel,
+                               volts=args.volts,
+                               wiggle=not args.no_wiggle)
+
     stop_event = threading.Event()
     tx_lock = threading.Lock()
     link = {"last_rx": None, "started": time.monotonic(),
             "last_warn": 0.0, "rx_count": 0, "tx_count": 0, "tx_errors": 0,
-            "hs_rx_count": 0, "hs_tx_count": 0}
+            "hs_rx_count": 0, "hs_tx_count": 0, "telemetry_tx": 0}
 
     say("SPECTER bench simulator.")
     say("interface : %s" % args.interface)
@@ -933,6 +1176,21 @@ def main():
     say("Checklist : %d steps at indices 0 to %d. Slot %d is the shore link."
         % (SPECTER_STEPS_IN_USE, SPECTER_STEPS_IN_USE - 1, SHORE_LINK_SLOT))
     say("Every step starts at PENDING.")
+    if args.no_telemetry:
+        say("Vessel telemetry: NOT TRANSMITTED. The gauges will go stale.")
+    else:
+        say("Vessel telemetry, sent as the VESSEL sends it:")
+        say("  can_id 0x%06X  tid 0x%04X source 0x%02X  fuel level, %%, "
+            "every %.0f ms"
+            % ((TID_FUEL_LEVEL << 8) | NMEA_SOURCE, TID_FUEL_LEVEL,
+               NMEA_SOURCE, TELEMETRY_PERIOD_S * 1000))
+        say("  can_id 0x%06X  tid 0x%04X source 0x%02X  alternator "
+            "potential, V, every %.0f ms"
+            % ((TID_ALTERNATOR_POTENTIAL << 8) | YANMAR_SOURCE,
+               TID_ALTERNATOR_POTENTIAL, YANMAR_SOURCE,
+               TELEMETRY_PERIOD_S * 1000))
+        say("  NOTE: 0x1805 is the ALTERNATOR potential. It is not the "
+            "battery and not the stud voltage.")
     if args.refuse_handshake != "accept":
         say("FAULT INJECTION: answer every handshake with %s."
             % args.refuse_handshake)
@@ -959,8 +1217,17 @@ def main():
         target=tx_worker,
         args=(tx_sock, tx_lock, state, stop_event, link, options),
         name="tx", daemon=True)
+    telemetry_thread = None
+    if not args.no_telemetry:
+        telemetry_thread = threading.Thread(
+            target=telemetry_worker,
+            args=(tx_sock, tx_lock, TELEMETRY, stop_event, link),
+            name="telemetry", daemon=True)
+
     rx_thread.start()
     tx_thread.start()
+    if telemetry_thread is not None:
+        telemetry_thread.start()
 
     if args.duration > 0:
         def stop_later():
@@ -989,6 +1256,9 @@ def main():
         rx_thread.join(timeout=2.0)
         rx_sock.close()
         tx_sock.close()
+        if telemetry_thread is not None:
+            telemetry_thread.join(timeout=2.0)
+        say("Telemetry frames sent: %d." % link["telemetry_tx"])
         say("Stopped. TX frames accepted: %d. TX errors: %d. "
             "RX display frames decoded: %d. Handshakes answered: %d."
             % (link["tx_count"], link["tx_errors"], link["rx_count"],
