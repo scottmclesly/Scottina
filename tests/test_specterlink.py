@@ -264,12 +264,52 @@ class TestIds(unittest.TestCase):
         afternoon to that; this keeps it lost only once."""
         import struct
         reader = SL.SpecterReader.__new__(SL.SpecterReader)   # no socket
-        vals = struct.unpack("=IIII", reader._filter())
-        for mask in (vals[1], vals[3]):
+        blob = reader._filter()
+        # Four filters now: the two periodic frames and the handshake pair.
+        # Read the length rather than pin it, so adding a fifth id does not
+        # break this test for the wrong reason.
+        self.assertEqual(len(blob) % 8, 0, "each filter is an id and a mask")
+        count = len(blob) // 8
+        vals = struct.unpack("=" + "I" * (count * 2), blob)
+        ids = [vals[i] & SL.CAN_EFF_MASK for i in range(0, len(vals), 2)]
+        masks = [vals[i] for i in range(1, len(vals), 2)]
+        for mask in masks:
             self.assertEqual(mask & 0x20000000, 0,
                              "CAN_ERR_FLAG must not appear in the mask")
-        self.assertEqual(vals[0] & SL.CAN_EFF_MASK, SL.DISPLAY_CAN_ID)
-        self.assertEqual(vals[2] & SL.CAN_EFF_MASK, SL.NODE_CAN_ID)
+        self.assertIn(SL.DISPLAY_CAN_ID, ids)
+        self.assertIn(SL.NODE_CAN_ID, ids)
+        self.assertIn(SL.HS_REQUEST_CAN_ID, ids)
+        self.assertIn(SL.HS_RESPONSE_CAN_ID, ids)
+
+    def test_the_handshake_pair_is_decoded(self):
+        """The panel shows the firmware identity, so the pair must decode."""
+        req = SL.decode(bytes([1, 0xED, 0xBF, 24, 0, 0, 0, 0]),
+                        SL.HS_REQUEST_CAN_ID)
+        self.assertEqual(req["firmware_id"], 0xEDBF)
+        self.assertEqual(req["firmware_text"], "0x EDBF".replace(" ", ""))
+        self.assertEqual(req["step_capacity"], 24)
+
+        rsp = SL.decode(bytes([1, 0, 1, 0, 7, 0, 13, 0]),
+                        SL.HS_RESPONSE_CAN_ID)
+        self.assertEqual(rsp["result_text"], "ACCEPT")
+        self.assertEqual(rsp["checklist_id"], 0x0001)
+        self.assertEqual(rsp["session_id"], 7)
+        self.assertEqual(rsp["step_count"], 13)
+
+    def test_an_image_with_no_identity_is_named_not_called_version_zero(self):
+        """0x0000 is not a version. It means the build cannot say."""
+        req = SL.decode(bytes([1, 0, 0, 24, 0, 0, 0, 0]),
+                        SL.HS_REQUEST_CAN_ID)
+        self.assertEqual(req["firmware_id"], 0)
+        self.assertEqual(req["firmware_text"], "none")
+
+    def test_every_step_has_a_name_and_slot_13_is_not_a_step(self):
+        self.assertEqual(len(SL.STEP_NAMES), SL.STEPS_IN_USE)
+        self.assertEqual(SL.step_name(0), "automatic systems test")
+        self.assertEqual(SL.step_name(7), "E-STOP test")
+        self.assertEqual(SL.step_name(12), "navigation lights")
+        self.assertEqual(SL.step_name(SL.SHORE_LINK_SLOT),
+                         "shore operator link")
 
 
 class TestLinkHealthParse(unittest.TestCase):

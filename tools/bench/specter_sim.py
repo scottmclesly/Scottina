@@ -109,7 +109,7 @@ try:
         encode_status_frame,
         step_name,
     )
-    from specter_pkg.tocan_codec import encode_raw as encode_raw_tocan
+    from specter_pkg.tocan_codec import encode_physical
     from specter_pkg.tocan_ids import ToCanTid
     from specter_pkg.tocan_ids import (
         DISPLAY_CAN_SOURCE,
@@ -201,6 +201,51 @@ NMEA_SOURCE = 0x83
 YANMAR_SOURCE = 0x82
 
 TELEMETRY_PERIOD_S = 1.0
+TELEMETRY_FAST_PERIOD_S = 0.1          # the 10 Hz messages
+
+# --------------------------------------------------------------------------
+# The full vessel telemetry table.
+# --------------------------------------------------------------------------
+# Every entry is a message the display shows a value for, and every field of
+# it is quoted from a document:
+#
+#   tid, field   temp/ToCAN.c send_0x....(), byte offset and width
+#   scale        temp/can_node.cpp, applied through the SHARED CODEC, never
+#                repeated here
+#   source       BEN_TOCAN_SOURCE_IDS.md. Ben's TID list gives the transmitter
+#                as the device CLASS, "ToCAN device". Engine feedback is the
+#                Yanmar device 0x82; a tank sensor is the NMEA device 0x83.
+#   rate         BEN_TOCAN_IDS.md, the "Rate" column, verbatim
+#
+# centre and swing are the BENCH value only. They are not from any document
+# and they exist so a gauge visibly moves. Both are bounded, so a long
+# demonstration cannot wander out of a sane range.
+#
+# (tid, source, field, centre, swing, period_s, label)
+TELEMETRY_TABLE = (
+    (0x5000, NMEA_SOURCE,   'fuel_level',            78.0,  None, 1.0,
+     'fuel level %'),
+    (0x1805, YANMAR_SOURCE, 'potential',             14.40, 0.35, 1.0,
+     'alternator potential V'),
+    (0x1800, YANMAR_SOURCE, 'rpm',                  850.0, 60.0,  0.1,
+     'engine rpm'),
+    (0x1801, YANMAR_SOURCE, 'tilt_trim',              4.0,  3.0,  1.0,
+     'engine tilt/trim deg'),
+    (0x1803, YANMAR_SOURCE, 'oil_temperature',       92.0,  3.0,  1.0,
+     'engine oil temperature degC'),
+    (0x1804, YANMAR_SOURCE, 'engine_temperature',    82.0,  3.0,  1.0,
+     'engine temperature degC'),
+    (0x1806, YANMAR_SOURCE, 'fuel_rate',              0.012, 0.004, 1.0,
+     'fuel rate m^3/h'),
+    (0x1807, YANMAR_SOURCE, 'engine_seconds',   4460400.0,  None, 1.0,
+     'engine hours s'),
+    (0x180A, YANMAR_SOURCE, 'percent_engine_load',   35.0,  8.0,  1.0,
+     'engine load %'),
+    (0x180B, YANMAR_SOURCE, 'percent_engine_torque', 30.0,  8.0,  1.0,
+     'engine torque %'),
+    (0x180F, YANMAR_SOURCE, 'oil_temperature',       70.0,  3.0,  0.1,
+     'transmission oil temperature degC'),
+)
 
 # The scales are NOT repeated here. They come from the shared codec, which
 # takes them from can_node.cpp. One definition of every byte.
@@ -503,33 +548,38 @@ class SimState:
 
 
 class TelemetryState:
-    """Fuel level and alternator potential, as the vessel sends them.
+    """Every dynamic value the display shows, as the vessel sends it.
 
-    The rig holds a physical value. The codec turns it into the raw count the
-    vessel puts on the wire. Nothing here knows a byte layout or a scale.
+    The rig holds PHYSICAL values. The shared codec turns each one into the
+    raw count the vessel puts on the wire. Nothing here knows a byte layout
+    or a scale.
     """
 
     def __init__(self, fuel_percent=78.0, volts=VOLTS_CENTRE, wiggle=True):
         self.lock = threading.Lock()
-        self.fuel_percent = fuel_percent
-        self.volts = volts
         self.wiggle = wiggle
         self.elapsed = 0.0
-        self.fuel_frames = 0
-        self.volt_frames = 0
+        self.values = {}
+        for tid, _src, field, centre, _swing, _rate, _label in TELEMETRY_TABLE:
+            self.values[(tid, field)] = centre
+        # The two the operator sets by name keep their command-line defaults.
+        self.values[(0x5000, 'fuel_level')] = fuel_percent
+        self.values[(0x1805, 'potential')] = volts
 
+    # -- the two named values the console sets -----------------------------
     def set_fuel(self, percent):
         """Set the fuel level. It is held inside the plausible range."""
         with self.lock:
-            self.fuel_percent = max(FUEL_PERCENT_MIN,
-                                    min(FUEL_PERCENT_MAX, float(percent)))
-            return self.fuel_percent
+            v = max(FUEL_PERCENT_MIN, min(FUEL_PERCENT_MAX, float(percent)))
+            self.values[(0x5000, 'fuel_level')] = v
+            return v
 
     def set_volts(self, volts):
         """Set the alternator potential. Held inside the plausible range."""
         with self.lock:
-            self.volts = max(VOLTS_MIN, min(VOLTS_MAX, float(volts)))
-            return self.volts
+            v = max(VOLTS_MIN, min(VOLTS_MAX, float(volts)))
+            self.values[(0x1805, 'potential')] = v
+            return v
 
     def set_wiggle(self, on):
         with self.lock:
@@ -537,83 +587,103 @@ class TelemetryState:
             return self.wiggle
 
     def advance(self, seconds):
-        """Move both values one step. Bounded, so a demonstration is safe."""
+        """Move every value one step. Bounded, so a demonstration is safe."""
         with self.lock:
             if not self.wiggle:
                 return
             self.elapsed += seconds
-            # Fuel drifts down and stops at the floor, so a long demonstration
-            # never runs the tank to empty and never goes negative.
-            self.fuel_percent = max(
-                FUEL_WIGGLE_FLOOR,
-                self.fuel_percent - FUEL_DRIFT_PERCENT_PER_SECOND * seconds)
-            # Voltage swings slowly around the charging value. A sine is
-            # bounded by construction, so it cannot wander.
-            phase = (self.elapsed / VOLTS_PERIOD_S) * 2.0 * math.pi
-            self.volts = VOLTS_CENTRE + VOLTS_SWING * math.sin(phase)
+            for tid, _src, field, centre, swing, _rate, _lab in TELEMETRY_TABLE:
+                key = (tid, field)
+                if key == (0x5000, 'fuel_level'):
+                    # Fuel drifts DOWN and stops at a floor, as a tank does.
+                    self.values[key] = max(
+                        FUEL_WIGGLE_FLOOR,
+                        self.values[key]
+                        - FUEL_DRIFT_PERCENT_PER_SECOND * seconds)
+                    continue
+                if swing is None:
+                    continue    # a value that does not move, such as hours
+                # A sine is bounded by construction, so it cannot wander.
+                phase = (self.elapsed / VOLTS_PERIOD_S) * 2.0 * math.pi
+                phase += float(tid % 7) * 0.9      # so they do not move as one
+                self.values[key] = centre + swing * math.sin(phase)
 
     def snapshot(self):
         with self.lock:
-            return self.fuel_percent, self.volts, self.wiggle
+            return (self.values[(0x5000, 'fuel_level')],
+                    self.values[(0x1805, 'potential')],
+                    self.wiggle)
 
-    def frames(self):
-        """Build both telemetry frames. Return (can_id, data) pairs.
+    def frames(self, period_s=None):
+        """Build the telemetry frames. Return one tuple for each message.
 
-        The raw counts come from the shared codec, so the scale is the one
-        can_node.cpp uses and cannot drift from the display.
+        `period_s` selects a rate group, so the 10 Hz messages go out at 10 Hz
+        and the 1 Hz messages at 1 Hz, exactly as the vessel sends them. None
+        returns every message, which is what the console report wants.
+
+        The raw counts come from the SHARED CODEC through `encode_physical`,
+        so the scale is the one can_node.cpp uses. No scale is repeated here
+        and this rig cannot drift from the display.
         """
-        fuel_percent, volts, _ = self.snapshot()
+        out = []
+        for tid, source, field, _centre, _swing, rate, label in TELEMETRY_TABLE:
+            if (period_s is not None) and (abs(rate - period_s) > 1e-9):
+                continue
+            value = self.value_of(tid, field)
+            data = encode_physical(tid, **{field: value})
+            out.append(((tid << 8) | source, data, value, label, tid, source))
+        return tuple(out)
 
-        # 0x5000 fuel level: 1/250 percent per bit, unsigned.
-        raw_fuel = int(round(fuel_percent * 250.0))
-        raw_fuel = max(0, min(0xFFFF, raw_fuel))
-
-        # 0x1805 alternator potential: 0.01 V per bit, signed.
-        raw_volts = int(round(volts * 100.0))
-        raw_volts = max(-32768, min(32767, raw_volts))
-
+    def value_of(self, tid, field):
+        """Return the current physical value of one field."""
         with self.lock:
-            self.fuel_frames += 1
-            self.volt_frames += 1
-
-        return (
-            ((TID_FUEL_LEVEL << 8) | NMEA_SOURCE,
-             encode_raw_tocan(TID_FUEL_LEVEL, fuel_level=raw_fuel),
-             fuel_percent, raw_fuel, '%'),
-            ((TID_ALTERNATOR_POTENTIAL << 8) | YANMAR_SOURCE,
-             encode_raw_tocan(TID_ALTERNATOR_POTENTIAL, potential=raw_volts),
-             volts, raw_volts, 'V'),
-        )
+            return self.values.get((tid, field), 0.0)
 
 
 def telemetry_worker(sock, tx_lock, telemetry, stop_event, link):
-    """Send the two vessel telemetry frames every second.
+    """Send the vessel telemetry at the rate each message documents.
 
-    This runs with the rig. The panel NODE button starts and stops the unit,
-    so NODE on means the rig transmits, telemetry included, and NODE off means
-    the bus goes quiet. Scottina and a vessel never share a bus, so there is
-    nothing to collide with and no separate flag is needed.
+    BEN_TOCAN_IDS.md gives a rate for every message. Engine rpm and the
+    transmission are 10 Hz; the rest are 1 Hz. The rig sends each group at its
+    own rate, so the wire looks like the vessel's and not like one loop.
+
+    This runs with the rig, so the panel NODE button gates it like everything
+    else. NODE on means the rig transmits. NODE off means the bus goes quiet.
     """
     errors = 0
     last_error_report = 0.0
+    slow_due = 0.0
+    elapsed = 0.0
+
     while not stop_event.is_set():
-        telemetry.advance(TELEMETRY_PERIOD_S)
-        for can_id, data, _value, _raw, _unit in telemetry.frames():
-            try:
-                with tx_lock:
-                    send_frame(sock, can_id, data)
-                link['telemetry_tx'] += 1
-            except OSError as error:
-                if error.errno in (errno.EBADF, errno.ENOTCONN, errno.ENODEV):
-                    if not stop_event.is_set():
-                        say('Telemetry TX stopped. Socket error: %s' % error)
-                    return
-                errors += 1
-                now = time.monotonic()
-                if now - last_error_report >= 5.0:
-                    last_error_report = now
-                    say('Telemetry TX error (%d so far): %s' % (errors, error))
-        stop_event.wait(TELEMETRY_PERIOD_S)
+        telemetry.advance(TELEMETRY_FAST_PERIOD_S)
+        elapsed += TELEMETRY_FAST_PERIOD_S
+
+        groups = [TELEMETRY_FAST_PERIOD_S]
+        if elapsed >= slow_due:
+            slow_due = elapsed + TELEMETRY_PERIOD_S
+            groups.append(TELEMETRY_PERIOD_S)
+
+        for period in groups:
+            for can_id, data, _v, _label, _tid, _src in telemetry.frames(period):
+                try:
+                    with tx_lock:
+                        send_frame(sock, can_id, data)
+                    link['telemetry_tx'] += 1
+                except OSError as error:
+                    if error.errno in (errno.EBADF, errno.ENOTCONN,
+                                       errno.ENODEV):
+                        if not stop_event.is_set():
+                            say('Telemetry TX stopped. Socket error: %s'
+                                % error)
+                        return
+                    errors += 1
+                    now = time.monotonic()
+                    if now - last_error_report >= 5.0:
+                        last_error_report = now
+                        say('Telemetry TX error (%d so far): %s'
+                            % (errors, error))
+        stop_event.wait(TELEMETRY_FAST_PERIOD_S)
 
 
 def open_rx_socket(interface):
@@ -909,26 +979,24 @@ def show_outgoing(state, reason):
 def show_telemetry(telemetry):
     """Print what telemetry is on the wire, and at what period.
 
-    Anyone watching the rig can read this and know exactly what the display
-    is being told, and from which address.
+    Anyone watching the rig can read this and know exactly what the display is
+    being told, from which address, and how often.
     """
-    fuel_percent, volts, wiggle = telemetry.snapshot()
+    _fuel, _volts, wiggle = telemetry.snapshot()
     lines = ["-" * 66,
              "Vessel telemetry. These frames are what the VESSEL sends.",
-             "  period : %.0f ms each, both messages" % (TELEMETRY_PERIOD_S * 1000),
              "  wiggle : %s" % ("on, values drift" if wiggle
-                                else "off, values held steady")]
-    for can_id, data, value, raw, unit in telemetry.frames():
-        raw_text = " ".join("%02X" % b for b in data)
-        lines.append(
-            "  can_id 0x%06X  tid 0x%04X  source 0x%02X  %8.2f %-1s  "
-            "raw %6d  %s"
-            % (can_id, (can_id >> 8) & 0xFFFF, can_id & 0xFF, value, unit,
-               raw, raw_text))
-    lines.append("  cansend form:")
-    for can_id, data, _v, _r, _u in telemetry.frames():
-        lines.append("    %08X#%s"
-                     % (can_id, "".join("%02X" % b for b in data)))
+                                else "off, values held steady"),
+             "  %-9s %-6s %-34s %10s  %s"
+             % ("can_id", "rate", "value", "raw", "bytes")]
+    for can_id, data, value, label, tid, _src in telemetry.frames():
+        rate = next(r for (t2, _s, _f, _c, _w, r, _l) in TELEMETRY_TABLE
+                    if t2 == tid)
+        lines.append("  0x%06X  %4.0fHz %-34s %10.3f  %s"
+                     % (can_id, 1.0 / rate, label, value,
+                        " ".join("%02X" % b for b in data)))
+    lines.append("  NOTE: 0x1805 is the ALTERNATOR potential. It is not the "
+                 "battery and not the stud voltage.")
     say("\n".join(lines))
 
 
@@ -1180,27 +1248,11 @@ def main():
         say("Vessel telemetry: NOT TRANSMITTED. The gauges will go stale.")
     else:
         say("Vessel telemetry, sent as the VESSEL sends it:")
-        say("  can_id 0x%06X  tid 0x%04X source 0x%02X  fuel level, %%, "
-            "every %.0f ms"
-            % ((TID_FUEL_LEVEL << 8) | NMEA_SOURCE, TID_FUEL_LEVEL,
-               NMEA_SOURCE, TELEMETRY_PERIOD_S * 1000))
-        say("  can_id 0x%06X  tid 0x%04X source 0x%02X  alternator "
-            "potential, V, every %.0f ms"
-            % ((TID_ALTERNATOR_POTENTIAL << 8) | YANMAR_SOURCE,
-               TID_ALTERNATOR_POTENTIAL, YANMAR_SOURCE,
-               TELEMETRY_PERIOD_S * 1000))
+        for tid, source, _field, _c, _w, rate, label in TELEMETRY_TABLE:
+            say("  can_id 0x%06X  tid 0x%04X source 0x%02X  %-34s %2.0f Hz"
+                % ((tid << 8) | source, tid, source, label, 1.0 / rate))
         say("  NOTE: 0x1805 is the ALTERNATOR potential. It is not the "
             "battery and not the stud voltage.")
-    if args.refuse_handshake != "accept":
-        say("FAULT INJECTION: answer every handshake with %s."
-            % args.refuse_handshake)
-    if args.drop_status_after:
-        say("FAULT INJECTION: stop the status frame after %d frames."
-            % args.drop_status_after)
-    if args.hold_echo:
-        say("FAULT INJECTION: never echo an accepted event sequence.")
-    if args.bad_step_count:
-        say("FAULT INJECTION: claim a step count above the capacity.")
     show_outgoing(state, "Start state.")
 
     def handle_signal(_signum, _frame):

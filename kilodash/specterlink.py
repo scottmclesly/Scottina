@@ -62,8 +62,129 @@ import time
 from .busmon import (CAN_EFF_FLAG, CAN_EFF_MASK, CAN_RTR_FLAG, FRAME_SIZE,
                      parse_frame)
 
-DISPLAY_CAN_ID = 0x240220        # the Screen's display heartbeat
-NODE_CAN_ID = 0x248021           # the boat side's node status
+DISPLAY_CAN_ID = 0x240220        # the Screen's display frame
+NODE_CAN_ID = 0x248021           # the boat side's status frame
+HS_REQUEST_CAN_ID = 0x240320     # the Screen asks for a handshake
+HS_RESPONSE_CAN_ID = 0x248121    # the boat side answers
+
+#: The 13 steps, in the order the wire numbers them. The panel shows a name
+#: against each state, because "step 7 FAULT" means nothing across a bench and
+#: "E-STOP test FAULT" means everything.
+STEP_NAMES = (
+    "automatic systems test",
+    "steering",
+    "engine trim",
+    "seakeeper ride trim",
+    "payload hatch",
+    "engine ventilation",
+    "power ACC mode test",
+    "E-STOP test",
+    "comms test",
+    "telemetry",
+    "engine start",
+    "engine health",
+    "navigation lights",
+)
+
+#: Byte 4 of the display frame.
+DISPLAY_STATES = ("BLOCKED", "PIN", "RUNNING", "STALE", "FAULT REVIEW")
+
+#: Byte 2 of the display frame.
+EVENT_TYPES = ("NONE", "SESSION BEGIN", "STEP BEGIN", "STEP CONFIRM",
+               "STEP RERUN", "STEP ABORT", "SESSION ABORT", "SESSION COMPLETE")
+
+#: Byte 1 of the handshake response.
+HS_RESULTS = ("ACCEPT", "REJECT PROTOCOL", "REJECT CAPACITY",
+              "REJECT NOT READY")
+
+
+#: What the bench rig transmits, for the panel to NAME. DISPLAY ONLY.
+#:
+#: This holds a label and a rate. It holds no byte layout, no scale and no
+#: frame, so this package still constructs nothing: bench gear stays bench
+#: gear, and the tree-wide safety test keeps that true. The authoritative
+#: table, with the layouts and the bench values, lives with the rig itself.
+#: (tid, source, label, hz)
+TELEMETRY_SENT = (
+    (0x5000, 0x83, "fuel level %", 1),
+    (0x1805, 0x82, "alternator potential V", 1),
+    (0x1800, 0x82, "engine rpm", 10),
+    (0x1801, 0x82, "engine tilt/trim deg", 1),
+    (0x1803, 0x82, "engine oil temperature degC", 1),
+    (0x1804, 0x82, "engine temperature degC", 1),
+    (0x1806, 0x82, "fuel rate m^3/h", 1),
+    (0x1807, 0x82, "engine hours s", 1),
+    (0x180A, 0x82, "engine load %", 1),
+    (0x180B, 0x82, "engine torque %", 1),
+    (0x180F, 0x82, "transmission oil temperature degC", 10),
+)
+
+
+def step_name(index):
+    """Return the name of a step index, or a plain label for a spare slot."""
+    if 0 <= index < len(STEP_NAMES):
+        return STEP_NAMES[index]
+    if index == SHORE_LINK_SLOT:
+        return "shore operator link"
+    return "spare %d" % index
+
+
+def display_state_name(value):
+    if 0 <= value < len(DISPLAY_STATES):
+        return DISPLAY_STATES[value]
+    return "UNDEFINED %d" % value
+
+
+def event_type_name(value):
+    if 0 <= value < len(EVENT_TYPES):
+        return EVENT_TYPES[value]
+    return "UNDEFINED %d" % value
+
+
+def hs_result_name(value):
+    if 0 <= value < len(HS_RESULTS):
+        return HS_RESULTS[value]
+    return "UNDEFINED %d" % value
+
+
+def decode_hs_request(data):
+    """Decode the handshake request, 0x240320.
+
+    Bytes 1 and 2 carry the firmware identity: the low 16 bits of the git
+    commit the image was built from. 0x0000 means the image was built with no
+    identity and cannot say where it came from.
+    """
+    if data is None or len(data) != 8:
+        return None
+    fw = (data[1] << 8) | data[2]
+    return {
+        "protocol_version": data[0],
+        "firmware_id": fw,
+        "firmware_text": ("none" if fw == 0 else "0x%04X" % fw),
+        "step_capacity": data[3],
+        # LinkState reads these on every frame. The handshake pair
+        # carries no counter and no step states.
+        "sequence": None,
+        "states": None,
+    }
+
+
+def decode_hs_response(data):
+    """Decode the handshake response, 0x248121."""
+    if data is None or len(data) != 8:
+        return None
+    return {
+        "protocol_version": data[0],
+        "result": data[1],
+        "result_text": hs_result_name(data[1]),
+        "checklist_id": data[2] | (data[3] << 8),
+        "session_id": data[4] | (data[5] << 8),
+        "step_count": data[6],
+        # LinkState reads these on every frame. The handshake pair
+        # carries no counter and no step states.
+        "sequence": None,
+        "states": None,
+    }
 
 NOMINAL_PERIOD_S = 0.5           # the display frame. The status frame is 0.2
 NODE_PERIOD_S = 0.2              # the status frame, 200 ms
@@ -158,6 +279,8 @@ def decode_node(data):
 DECODERS = {
     DISPLAY_CAN_ID: decode_display,
     NODE_CAN_ID: decode_node,
+    HS_REQUEST_CAN_ID: decode_hs_request,
+    HS_RESPONSE_CAN_ID: decode_hs_response,
 }
 
 
@@ -262,8 +385,13 @@ class SpecterReader:
     frame — the bench lost an afternoon to that once already.
     """
 
-    def __init__(self, iface, display_link, node_link):
+    def __init__(self, iface, display_link, node_link,
+                 hs_request_link=None, hs_response_link=None):
         self.iface = iface
+        self.hs_request = hs_request_link or LinkState(HS_REQUEST_CAN_ID,
+                                                       "HS-REQ")
+        self.hs_response = hs_response_link or LinkState(HS_RESPONSE_CAN_ID,
+                                                         "HS-RSP")
         self.display = display_link
         self.node = node_link
         self.error = None
@@ -284,9 +412,11 @@ class SpecterReader:
 
     def _filter(self):
         mask = CAN_EFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG
-        return struct.pack("=IIII",
+        return struct.pack("=IIIIIIII",
                            DISPLAY_CAN_ID | CAN_EFF_FLAG, mask,
-                           NODE_CAN_ID | CAN_EFF_FLAG, mask)
+                           NODE_CAN_ID | CAN_EFF_FLAG, mask,
+                           HS_REQUEST_CAN_ID | CAN_EFF_FLAG, mask,
+                           HS_RESPONSE_CAN_ID | CAN_EFF_FLAG, mask)
 
     def _run(self):
         try:
@@ -321,6 +451,10 @@ class SpecterReader:
                     self.display.ingest(time.time(), data)
                 elif cid == NODE_CAN_ID:
                     self.node.ingest(time.time(), data)
+                elif cid == HS_REQUEST_CAN_ID:
+                    self.hs_request.ingest(time.time(), data)
+                elif cid == HS_RESPONSE_CAN_ID:
+                    self.hs_response.ingest(time.time(), data)
         except OSError as e:
             self.error = f"{self.iface}: {e.strerror or e}"
         finally:

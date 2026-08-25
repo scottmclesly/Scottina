@@ -150,6 +150,11 @@ class SpecterScreen(Screen):
         d = self.display.snapshot(now)
         n = self.node.snapshot(now)
         self._snap = (d, n)
+        if self.reader is not None:
+            self._hs = (self.reader.hs_request.snapshot(now),
+                        self.reader.hs_response.snapshot(now))
+        else:
+            self._hs = (None, None)
         # Fast refresh only while something is actually flowing.
         self.tick_interval = FAST_TICK if (d["alive"] or n["alive"]) \
             else IDLE_TICK
@@ -182,6 +187,7 @@ class SpecterScreen(Screen):
                         for g, v in zip(SL.GROUP_LETTERS, s["states"])),
                     "state": "fault" if SL.FAULT in s["states"] else None,
                 })
+        rows.extend(self.specter_rows())
         b = self.bus
         rows.append({
             "label": "BUS %s" % IFACE,
@@ -189,6 +195,125 @@ class SpecterScreen(Screen):
             "state": ("ok" if b.get("can_state") == "ERROR-ACTIVE"
                       else "fault" if b.get("present") else None),
         })
+        return rows
+
+    def specter_rows(self):
+        """The full SPECTER state, as the display reports it.
+
+        Everything here is DECODED FROM THE WIRE. The panel constructs no
+        frame and echoes nothing of its own: what it shows for the display is
+        what the display actually put on the bus.
+        """
+        rows = []
+        disp, node = self._snap
+        df = disp.get("fields") or {}
+        nf = node.get("fields") or {}
+        hs_req, hs_rsp = getattr(self, "_hs", (None, None))
+
+        # ---- what the display says it is doing ----
+        if df:
+            rows.append({
+                "label": "DISPLAY STATE",
+                "value": SL.display_state_name(df.get("display_state", 0)),
+                "state": "ok" if df.get("display_state") == 2 else "caution",
+            })
+            seq = df.get("event_sequence", 0)
+            echo = nf.get("event_echo")
+            if seq:
+                cleared = (echo == seq)
+                rows.append({
+                    "label": "EVENT",
+                    "value": "seq %d  %s  step %s  echo %s"
+                             % (seq,
+                                SL.event_type_name(df.get("event_type", 0)),
+                                ("none" if df.get("step_index") == 0xFF
+                                 else SL.step_name(df.get("step_index", 0))),
+                                ("cleared" if cleared else "outstanding")),
+                    "state": None if cleared else "caution",
+                })
+            else:
+                rows.append({"label": "EVENT", "value": "none outstanding",
+                             "state": None})
+
+        # ---- the veto, which is the whole point of the checklist ----
+        if nf:
+            veto = bool(nf.get("veto"))
+            good = sum(1 for s in nf.get("steps", []) if s == SL.GOOD)
+            rows.append({
+                "label": "VETO",
+                "value": ("SET  %d of %d steps GOOD" % (good, SL.STEPS_IN_USE)
+                          if veto else "CLEAR  checklist complete"),
+                "state": "caution" if veto else "ok",
+            })
+            if nf.get("operator_input_requested"):
+                rows.append({"label": "NODE", "value": "waiting for operator",
+                             "state": "caution"})
+
+            # ---- all 13 steps, by name ----
+            for index, value in enumerate(nf.get("steps", [])):
+                rows.append({
+                    "label": "%2d %s" % (index, SL.step_name(index)),
+                    "value": SL.STATE_NAMES[value],
+                    "state": ("ok" if value == SL.GOOD
+                              else "fault" if value == SL.FAULT
+                              else "caution" if value == SL.ACTIVE else None),
+                })
+
+            # ---- slot 13, which is NOT a step ----
+            shore = nf.get("shore_link")
+            if shore is not None:
+                rows.append({
+                    "label": "13 %s" % SL.step_name(SL.SHORE_LINK_SLOT),
+                    "value": "%s  (not a checklist step)"
+                             % SL.STATE_NAMES[shore],
+                    "state": "ok" if shore == SL.GOOD else None,
+                })
+
+        # ---- the handshake, and which build the display is ----
+        if hs_req and hs_req.get("fields"):
+            f = hs_req["fields"]
+            rows.append({
+                "label": "FIRMWARE",
+                "value": ("%s  protocol 0x%02X  capacity %d"
+                          % (f["firmware_text"], f["protocol_version"],
+                             f["step_capacity"])),
+                "state": "caution" if f["firmware_id"] == 0 else None,
+            })
+        if hs_rsp and hs_rsp.get("fields"):
+            f = hs_rsp["fields"]
+            rows.append({
+                "label": "HANDSHAKE",
+                "value": ("%s  checklist 0x%04X  session %d  steps %d"
+                          % (f["result_text"], f["checklist_id"],
+                             f["session_id"], f["step_count"])),
+                "state": "ok" if f["result"] == 0 else "fault",
+            })
+
+        # ---- what this rig is putting on the wire ----
+        rows.extend(self.telemetry_rows())
+        return rows
+
+    def telemetry_rows(self):
+        """The telemetry the RIG is sending.
+
+        The rig is the only thing on a bench bus that sends these, so this
+        says plainly what the display is being told and from which address.
+        It reads a description, never the rig module: importing that at draw
+        time would run its codec import, which exits on failure, and a panel
+        render must never be able to take the tile down.
+        """
+        if not self._sim_on:
+            return [{"label": "TELEMETRY", "value": "NODE off, bus quiet",
+                     "state": None}]
+        rows = [{"label": "TELEMETRY",
+                 "value": "%d messages, vessel ids" % len(SL.TELEMETRY_SENT),
+                 "state": "ok"}]
+        for tid, source, label, hz in SL.TELEMETRY_SENT:
+            rows.append({
+                "label": "0x%06X" % ((tid << 8) | source),
+                "value": "%-32s %2d Hz" % (label, hz),
+                "state": None,
+            })
         return rows
 
     @staticmethod
