@@ -6,21 +6,38 @@ the socket: the two periodic frames of the preflight link, their liveness,
 their measured period, their sequence continuity, and the seven decoded
 group states.
 
-The link is one bench bus with two periodic 8-byte frames, both 500 ms,
-both little-endian, both the same layout:
+The link is one bench bus with two periodic 8-byte frames, both
+little-endian. They no longer share one layout. Each id has its own:
 
-    can_id 0x240220   display heartbeat   the Screen talks
-    can_id 0x248021   node status         the boat side talks
+    can_id 0x240220   display frame   the Screen talks     500 ms
+    byte 0 liveness_counter   byte 1 event_sequence
+    byte 2 event_type         byte 3 step_index
+    byte 4 display_state      bytes 5 to 7 reserved
 
-    byte 0 protocol_version   byte 1 session_id   byte 2 sequence
-    byte 3 flags   bit0 preflight_incomplete, bits1-3 active_group,
-                   bit4 session_active
-    byte 4 step_states_lo     g1 bits0-1, g2 bits2-3, g3 bits4-5, g4 bits6-7
-    byte 5 step_states_hi     g5 bits0-1, g6 bits2-3, g7 bits4-5
-    byte 6 reserved           byte 7 checklist_version
+    can_id 0x248021   status frame    the boat side talks  200 ms
+    byte 0 flags   bit0 veto, bit1 operator_input_requested,
+                   bits2-3 vessel_mode, bits4-7 event_echo
+    bytes 1 to 6   24 step states, two bits each, step N at
+                   byte 1 + (N >> 2), shift (N & 3) * 2
+    byte 7         four spare step slots
 
     states  0 PENDING  1 ACTIVE  2 GOOD  3 FAULT
     groups  g1..g7 = S P E1 C T E2 R
+
+THE SEVEN GROUPS ARE A ROLLUP, NOT THE WIRE
+The wire carries 13 steps at indices 0 to 12. The seven groups are a
+display-side rollup of those steps and they are not on the bus. Each group
+covers a fixed set of step indices and the seven sets partition 0 to 12
+exactly once. The screen keeps its seven-cell strip unchanged.
+
+Only the status frame carries step states, so only the node link reports
+`states`. The display frame carries none and reports None, which the screen
+already handles.
+
+Sequence continuity is available on the DISPLAY link only. Its byte 0 is a
+liveness counter that steps once per frame. The status frame carries no
+counter, so the node link reports `sequence` None and counts no gap. Its
+liveness is the measured period and `alive`, not continuity.
 
 Scope (CAN-N2K-Split-TODO, hard constraint): **diagnostics only — this
 module and the SPECTER screen construct no TX frames and never write to the
@@ -48,7 +65,8 @@ from .busmon import (CAN_EFF_FLAG, CAN_EFF_MASK, CAN_RTR_FLAG, FRAME_SIZE,
 DISPLAY_CAN_ID = 0x240220        # the Screen's display heartbeat
 NODE_CAN_ID = 0x248021           # the boat side's node status
 
-NOMINAL_PERIOD_S = 0.5
+NOMINAL_PERIOD_S = 0.5           # the display frame. The status frame is 0.2
+NODE_PERIOD_S = 0.2              # the status frame, 200 ms
 STALE_S = 2.0                    # no frame for this long = STALE
 PERIOD_WINDOW = 40               # samples kept for avg/min/max
 
@@ -59,33 +77,99 @@ STATE_INITIALS = {PENDING: "P", ACTIVE: "A", GOOD: "G", FAULT: "F"}
 GROUP_LETTERS = ("S", "P", "E1", "C", "T", "E2", "R")
 
 
-def decode(data):
-    """Decode the 8 shared bytes. Return every field, or None if not 8 bytes.
+STEPS_IN_USE = 13                # steps 0 to 12 on the wire
+STEP_CAPACITY = 24               # packed slots the status frame carries
+SHORE_LINK_SLOT = 13             # not a step. The shore link only
 
-    Both frames carry the same layout, so one decoder serves both
-    directions — which is the point of the format and the reason the screen
-    can show them side by side.
+# Each group covers a fixed set of step indices. The seven sets partition
+# 0 to 12 exactly once, so every step belongs to one group and no step
+# belongs to two. This is a rollup for the strip. It is not on the wire.
+GROUP_STEPS = (
+    (1, 2, 3),
+    (4,),
+    (0, 6, 12),
+    (8,),
+    (9,),
+    (7,),
+    (5, 10, 11),
+)
+
+
+def unpack_steps(data):
+    """Unpack the 24 packed step states from a whole status frame."""
+    return [(data[1 + (n >> 2)] >> ((n & 3) * 2)) & 0x03
+            for n in range(STEP_CAPACITY)]
+
+
+def roll_up(steps):
+    """Roll the 13 steps up into the seven group states.
+
+    A group is GOOD when every step under it is GOOD. It is FAULT when any
+    step under it is FAULT. If neither holds it shows the state of the
+    LEAST ADVANCED step under it, running PENDING, ACTIVE, GOOD.
     """
+    out = []
+    for covered_indices in GROUP_STEPS:
+        covered = [steps[i] for i in covered_indices]
+        if all(state == GOOD for state in covered):
+            out.append(GOOD)
+        elif any(state == FAULT for state in covered):
+            out.append(FAULT)
+        else:
+            out.append(min(covered))
+    return out
+
+
+def decode_display(data):
+    """Decode the display frame, 0x240220. Return every field or None."""
     if data is None or len(data) != 8:
         return None
-    flags = data[3]
-    lo, hi = data[4], data[5]
     return {
-        "protocol_version": data[0],
-        "session_id": data[1],
-        "sequence": data[2],
-        "flags": flags,
-        "preflight_incomplete": flags & 0x01,
-        "active_group": (flags >> 1) & 0x07,
-        "session_active": (flags >> 4) & 0x01,
-        "step_states_lo": lo,
-        "step_states_hi": hi,
-        "states": [lo & 0x03, (lo >> 2) & 0x03, (lo >> 4) & 0x03,
-                   (lo >> 6) & 0x03, hi & 0x03, (hi >> 2) & 0x03,
-                   (hi >> 4) & 0x03],
-        "reserved": data[6],
-        "checklist_version": data[7],
+        "liveness_counter": data[0],
+        "sequence": data[0],          # the counter the screen tracks
+        "event_sequence": data[1] & 0x0F,
+        "event_type": data[2],
+        "step_index": data[3],
+        "display_state": data[4],
+        "states": None,               # the display frame carries no steps
     }
+
+
+def decode_node(data):
+    """Decode the status frame, 0x248021. Return every field or None."""
+    if data is None or len(data) != 8:
+        return None
+    flags = data[0]
+    steps = unpack_steps(data)
+    return {
+        "flags": flags,
+        "veto": flags & 0x01,
+        "preflight_incomplete": flags & 0x01,   # the veto, by its old name
+        "operator_input_requested": (flags >> 1) & 0x01,
+        "vessel_mode": (flags >> 2) & 0x03,
+        "event_echo": (flags >> 4) & 0x0F,
+        "sequence": None,             # the status frame carries no counter
+        "steps": steps[:STEPS_IN_USE],
+        "shore_link": steps[SHORE_LINK_SLOT],
+        "states": roll_up(steps),
+    }
+
+
+DECODERS = {
+    DISPLAY_CAN_ID: decode_display,
+    NODE_CAN_ID: decode_node,
+}
+
+
+def decode(data, can_id=NODE_CAN_ID):
+    """Decode one frame by its id. Return every field, or None.
+
+    The two ids no longer share a layout, so the id chooses the decoder.
+    """
+    decoder = DECODERS.get(can_id)
+    if decoder is None:
+        return None
+    return decoder(data)
 
 
 class LinkState:
@@ -111,7 +195,7 @@ class LinkState:
         self._periods = collections.deque(maxlen=PERIOD_WINDOW)
 
     def ingest(self, ts, data):
-        fields = decode(data)
+        fields = decode(data, self.can_id)
         if fields is None:
             with self._lock:
                 self.bad_dlc += 1
@@ -122,12 +206,15 @@ class LinkState:
             else:
                 self.first_rx = ts
             seq = fields["sequence"]
-            if self.last_seq is not None:
-                if seq == self.last_seq:
-                    self.repeats += 1
-                elif seq != (self.last_seq + 1) & 0xFF:
-                    self.gaps += 1
-            self.last_seq = seq
+            # The status frame carries no counter, so it reports None. Do
+            # not count a gap against a frame that has nothing to count.
+            if seq is not None:
+                if self.last_seq is not None:
+                    if seq == self.last_seq:
+                        self.repeats += 1
+                    elif seq != (self.last_seq + 1) & 0xFF:
+                        self.gaps += 1
+                self.last_seq = seq
             self.last_rx = ts
             self.frames += 1
             self.last_data = bytes(data)

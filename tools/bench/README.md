@@ -163,27 +163,63 @@ wrong against measured traffic, that gets reported — not silently retuned.**
 ## SPECTER bench link
 
 The boat side of the SPECTER preflight bench, so the link can be proven in
-both directions with the Screen on the bench. Two periodic 8-byte frames at
-500 ms on one 250 kbps bus:
+both directions with the Screen on the bench. Four 8-byte little-endian
+frames on one 250 kbps bus:
 
-| can_id | direction | who sends it |
-| --- | --- | --- |
-| `0x240220` | display heartbeat | the Screen |
-| `0x248021` | node status | these rigs |
+| can_id | direction | who sends it | period |
+| --- | --- | --- | --- |
+| `0x240220` | display frame | the Screen | 500 ms |
+| `0x240320` | handshake request | the Screen | 1000 ms while blocked |
+| `0x248021` | status frame | these rigs | 200 ms |
+| `0x248121` | handshake response | these rigs | one per request |
 
-Both frames share one little-endian layout: byte 0 `protocol_version`, byte 1
-`session_id`, byte 2 `sequence`, byte 3 flags (bit0 `preflight_incomplete`,
-bits1-3 `active_group`, bit4 `session_active`), byte 4 `step_states_lo`
-(g1-g4, two bits each), byte 5 `step_states_hi` (g5-g7), byte 6 reserved,
-byte 7 `checklist_version`. States are 0 PENDING, 1 ACTIVE, 2 GOOD, 3 FAULT;
-groups g1-g7 are S P E1 C T E2 R.
+**The two directions no longer share a layout.** The wire is owned by
+`SPECTER_Message_Specification.docx` in the display repository, and these
+rigs import the shared codec rather than repeat it, so they can never drift
+from the Screen. There is exactly one definition of every byte.
 
-- **`specter_sim.py`** — receives and decodes the display heartbeat, transmits
-  the node status every 500 ms, and holds the authoritative step states. Set
-  a group by hand from its console: `3 GOOD`, `g3 GOOD`, and `E1 GOOD` are the
-  same command; `all PENDING` sets every group.
+    display frame  0x240220
+    byte 0 liveness_counter   byte 1 event_sequence
+    byte 2 event_type         byte 3 step_index
+    byte 4 display_state      bytes 5-7 reserved
+
+    status frame   0x248021
+    byte 0 flags   bit0 veto, bit1 operator_input_requested,
+                   bits2-3 vessel_mode, bits4-7 event_echo
+    bytes 1-6      24 step states, two bits each
+    byte 7         four spare slots
+
+States are 0 PENDING, 1 ACTIVE, 2 GOOD, 3 FAULT.
+
+**The wire carries 13 steps at indices 0 to 12.** The seven groups
+`S P E1 C T E2 R` are how this console addresses them and how the tile draws
+them. Each group covers a fixed set of step indices and the seven sets
+partition 0 to 12 exactly once. A group is GOOD when every step under it is
+GOOD, FAULT when any step under it is FAULT, and otherwise it shows its LEAST
+advanced step. The rollup is display-side. It is not on the bus.
+
+Slot 13 is the shore operator link. It is **not** a checklist step: it is
+never walked, never started and never confirmed, and it never clears the veto.
+
+- **`specter_sim.py`** — receives and decodes the display frame, answers every
+  handshake request, transmits the status frame every 200 ms, and holds the
+  authoritative step states. Set a group by hand from its console: `3 GOOD`,
+  `g3 GOOD`, and `E1 GOOD` are the same command; `all PENDING` sets every
+  step. `s7 GOOD` sets one step by index, `walk` moves the first step that is
+  not GOOD one state forward, and `shore on` sets slot 13.
 
       python3 specter_sim.py can0
+
+  Fault injection, for proving the Screen fails closed:
+  `--refuse-handshake protocol|capacity|notready` answers every handshake with
+  that result; `--drop-status-after N` stops the status frame after N frames;
+  `--hold-echo` accepts an operator event but never echoes its sequence;
+  `--bad-step-count` claims a step count above the display capacity. The
+  Screen must refuse that, not resize its table.
+
+  The rig needs the shared codec. `tools/deploy_scottina.sh` in the display
+  repository puts it under `~/specter_bench/`. Set `SPECTER_CODEC_PATH` if it
+  lives anywhere else.
 
 - **`specter_tile.py`** — a terminal tile that **wraps** the simulator (it
   imports it; it does not reimplement it) and refreshes in place, so the bench

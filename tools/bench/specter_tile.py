@@ -395,7 +395,7 @@ def build_tile(interface, started, state, rx_stats, tx_stats, health, log,
     tx = tx_stats.snapshot()
     info, health_stamp = health.snapshot()
     log_lines = log.snapshot()
-    tx_states = state.snapshot()
+    tx_states = state.group_snapshot()
     now = time.monotonic()
 
     lines = []
@@ -444,24 +444,26 @@ def build_tile(interface, started, state, rx_stats, tx_stats, health, log,
 
     fields = rx["fields"]
     if fields:
-        group = fields["active_group"]
-        if 1 <= group <= 7:
-            group_text = "%d %s" % (group, GROUP_LETTERS[group - 1])
+        step = fields["step_index"]
+        if step == 0xFF:
+            step_text = "none"
         else:
-            group_text = "0 none"
-        lines.append("   %-9sproto %d  session %d  checklist %d  reserved %d"
-                     % ("header", fields["protocol_version"], fields["session_id"],
-                        fields["checklist_version"], fields["reserved"]))
-        lines.append("   %-9s0x%02X  preflight_incomplete %d  active_group %s  "
-                     "session_active %d"
-                     % ("flags", fields["flags"], fields["preflight_incomplete"],
-                        group_text, fields["session_active"]))
+            step_text = "%d" % step
+        lines.append("   %-9sliveness %d  display_state %d"
+                     % ("header", fields["liveness_counter"],
+                        fields["display_state"]))
+        lines.append("   %-9sseq %d  type %d %s  step %s"
+                     % ("event", fields["event_sequence"],
+                        fields["event_type"],
+                        specter_sim.event_name(fields["event_type"]),
+                        step_text))
         lines.append("   %-9s%s" % ("raw", format_raw(rx["data"])))
-        lines.append(states_header())
-        lines.append(states_row("state", fields["states"], palette))
+        # The display frame carries no step states. Only the status frame
+        # does, and this rig is the one that sends it. The TX panel below
+        # shows those. A row here would be an echo of our own state.
     else:
         lines.append("   %-9s-" % "header")
-        lines.append("   %-9s-" % "flags")
+        lines.append("   %-9s-" % "event")
         lines.append("   %-9s%s" % ("raw", "(none yet)"))
         lines.append(states_header())
         lines.append("   %-9s%s" % ("state", "no heartbeat decoded yet"))

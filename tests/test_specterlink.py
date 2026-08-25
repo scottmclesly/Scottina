@@ -2,7 +2,8 @@
 
 Run from the repo root:  python -m unittest discover -s tests
 
-Covers the shared 8-byte decode (both directions use one layout), liveness
+Covers the 8-byte decode of BOTH layouts (the two ids no longer share
+one), the seven-group rollup of the 13 wire steps, liveness
 and the STALE threshold, measured period, sequence continuity (gaps vs
 repeats, including 8-bit wrap), the `ip link` health parse, and — the scope
 constraint made executable — an AST scan proving the SPECTER model and
@@ -22,55 +23,142 @@ from kilodash import specterlink as SL  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def frame(seq=0, flags=0x11, lo=0x00, hi=0x00, proto=1, session=1, ver=1):
-    return bytes([proto, session, seq, flags, lo, hi, 0, ver])
+def display_frame(seq=0, event_seq=0, event_type=0, step=0xFF, state=0):
+    """Build one display frame, 0x240220. Byte 0 is the liveness counter."""
+    return bytes([seq, event_seq & 0x0F, event_type, step, state, 0, 0, 0])
+
+
+def node_frame(steps=None, veto=1, operator_input=0, mode=0, echo=0,
+               shore=None):
+    """Build one status frame, 0x248021.
+
+    `steps` is a dict of step index to state. Any step left out is PENDING.
+    `shore` sets slot 13, which is the shore link and is not a step.
+    """
+    packed = bytearray(8)
+    packed[0] = ((veto & 0x01)
+                 | ((operator_input & 0x01) << 1)
+                 | ((mode & 0x03) << 2)
+                 | ((echo & 0x0F) << 4))
+    values = dict(steps or {})
+    if shore is not None:
+        values[SL.SHORE_LINK_SLOT] = shore
+    for index, value in values.items():
+        packed[1 + (index >> 2)] |= (value & 0x03) << ((index & 3) * 2)
+    return bytes(packed)
+
+
+def all_steps(state):
+    """Every step in use at one state."""
+    return {index: state for index in range(SL.STEPS_IN_USE)}
 
 
 class TestDecode(unittest.TestCase):
     def test_rejects_wrong_length(self):
-        self.assertIsNone(SL.decode(b""))
-        self.assertIsNone(SL.decode(b"\x01" * 7))
-        self.assertIsNone(SL.decode(None))
-        self.assertIsNotNone(SL.decode(b"\x01" * 8))
+        for can_id in (SL.DISPLAY_CAN_ID, SL.NODE_CAN_ID):
+            self.assertIsNone(SL.decode(b"", can_id))
+            self.assertIsNone(SL.decode(b"\x01" * 7, can_id))
+            self.assertIsNone(SL.decode(None, can_id))
+            self.assertIsNotNone(SL.decode(b"\x01" * 8, can_id))
 
-    def test_header_fields(self):
-        f = SL.decode(frame(seq=0x2A, proto=1, session=7, ver=3))
-        self.assertEqual(f["protocol_version"], 1)
-        self.assertEqual(f["session_id"], 7)
+    def test_an_unknown_id_decodes_to_nothing(self):
+        self.assertIsNone(SL.decode(b"\x00" * 8, 0x123456))
+
+    def test_display_frame_fields(self):
+        f = SL.decode(display_frame(seq=0x2A, event_seq=3, event_type=2,
+                                    step=7, state=2),
+                      SL.DISPLAY_CAN_ID)
+        self.assertEqual(f["liveness_counter"], 0x2A)
         self.assertEqual(f["sequence"], 0x2A)
-        self.assertEqual(f["checklist_version"], 3)
-        self.assertEqual(f["reserved"], 0)
+        self.assertEqual(f["event_sequence"], 3)
+        self.assertEqual(f["event_type"], 2)
+        self.assertEqual(f["step_index"], 7)
+        self.assertEqual(f["display_state"], 2)
 
-    def test_flag_bits(self):
-        # bit0 preflight_incomplete, bits1-3 active_group, bit4 session_active
-        f = SL.decode(frame(flags=0x13))       # 0b00010011
-        self.assertEqual(f["preflight_incomplete"], 1)
-        self.assertEqual(f["active_group"], 1)
-        self.assertEqual(f["session_active"], 1)
-        f = SL.decode(frame(flags=0x0E))       # 0b00001110
-        self.assertEqual(f["preflight_incomplete"], 0)
-        self.assertEqual(f["active_group"], 7)
-        self.assertEqual(f["session_active"], 0)
+    def test_the_display_frame_carries_no_step_states(self):
+        f = SL.decode(display_frame(seq=1), SL.DISPLAY_CAN_ID)
+        self.assertIsNone(f["states"])
 
-    def test_group_states_span_both_bytes(self):
-        """g1..g4 in byte 4, g5..g7 in byte 5, two bits each, little-endian."""
-        f = SL.decode(frame(lo=0b11100100, hi=0b00011011))
-        #                     g4 g3 g2 g1        g7 g6 g5
-        self.assertEqual(f["states"],
-                         [SL.PENDING, SL.ACTIVE, SL.GOOD, SL.FAULT,
-                          SL.FAULT, SL.GOOD, SL.ACTIVE])
+    def test_status_flag_bits(self):
+        f = SL.decode(node_frame(veto=1, operator_input=1, mode=2, echo=5),
+                      SL.NODE_CAN_ID)
+        self.assertEqual(f["veto"], 1)
+        self.assertEqual(f["operator_input_requested"], 1)
+        self.assertEqual(f["vessel_mode"], 2)
+        self.assertEqual(f["event_echo"], 5)
+
+    def test_the_status_frame_carries_no_counter(self):
+        """It is a snapshot. A lost frame is corrected by the next one."""
+        f = SL.decode(node_frame(), SL.NODE_CAN_ID)
+        self.assertIsNone(f["sequence"])
+
+    def test_step_states_span_the_packed_bytes(self):
+        f = SL.decode(node_frame(steps={0: SL.ACTIVE, 4: SL.GOOD,
+                                        11: SL.FAULT, 12: SL.GOOD}),
+                      SL.NODE_CAN_ID)
+        self.assertEqual(f["steps"][0], SL.ACTIVE)
+        self.assertEqual(f["steps"][4], SL.GOOD)
+        self.assertEqual(f["steps"][11], SL.FAULT)
+        self.assertEqual(f["steps"][12], SL.GOOD)
+        self.assertEqual(f["steps"][1], SL.PENDING)
+        self.assertEqual(len(f["steps"]), SL.STEPS_IN_USE)
+
+    def test_the_seven_groups_partition_the_thirteen_steps(self):
+        covered = [step for group in SL.GROUP_STEPS for step in group]
+        self.assertEqual(sorted(covered), list(range(SL.STEPS_IN_USE)))
+        self.assertEqual(len(covered), len(set(covered)))
+
+    def test_a_group_is_good_only_when_every_step_is_good(self):
+        # Group 1 covers steps 1, 2 and 3.
+        f = SL.decode(node_frame(steps={1: SL.GOOD, 2: SL.GOOD, 3: SL.GOOD}),
+                      SL.NODE_CAN_ID)
+        self.assertEqual(f["states"][0], SL.GOOD)
+        f = SL.decode(node_frame(steps={1: SL.GOOD, 2: SL.GOOD}),
+                      SL.NODE_CAN_ID)
+        self.assertNotEqual(f["states"][0], SL.GOOD)
+
+    def test_any_fault_under_a_group_makes_the_group_fault(self):
+        f = SL.decode(node_frame(steps={1: SL.GOOD, 2: SL.FAULT,
+                                        3: SL.GOOD}),
+                      SL.NODE_CAN_ID)
+        self.assertEqual(f["states"][0], SL.FAULT)
+
+    def test_otherwise_a_group_shows_its_least_advanced_step(self):
+        # Group 3 covers steps 0, 6 and 12.
+        f = SL.decode(node_frame(steps={0: SL.ACTIVE, 6: SL.GOOD,
+                                        12: SL.GOOD}),
+                      SL.NODE_CAN_ID)
+        self.assertEqual(f["states"][2], SL.ACTIVE)
+        f = SL.decode(node_frame(steps={0: SL.PENDING, 6: SL.ACTIVE,
+                                        12: SL.GOOD}),
+                      SL.NODE_CAN_ID)
+        self.assertEqual(f["states"][2], SL.PENDING)
+
+    def test_every_group_is_good_when_every_step_is_good(self):
+        f = SL.decode(node_frame(steps=all_steps(SL.GOOD), veto=0),
+                      SL.NODE_CAN_ID)
+        self.assertEqual(f["states"], [SL.GOOD] * 7)
+
+    def test_the_shore_link_is_slot_thirteen_and_is_not_a_step(self):
+        """Slot 13 is the shore link. It is never a checklist step."""
+        f = SL.decode(node_frame(steps=all_steps(SL.GOOD), shore=SL.PENDING),
+                      SL.NODE_CAN_ID)
+        self.assertEqual(f["shore_link"], SL.PENDING)
+        # The shore link is absent from the steps and from the rollup.
+        self.assertEqual(len(f["steps"]), SL.STEPS_IN_USE)
+        self.assertEqual(f["states"], [SL.GOOD] * 7)
 
     def test_the_bench_vector(self):
-        """The exact bytes the bench put on the wire for S=ACTIVE, E1=GOOD,
-        T=FAULT — pinned so a layout change cannot pass silently."""
-        f = SL.decode(bytes([0x01, 0x01, 0x34, 0x13, 0x21, 0x03, 0x00, 0x01]))
+        """One real frame from the rig: step 0 ACTIVE, the rest PENDING."""
+        f = SL.decode(node_frame(steps={0: SL.ACTIVE}), SL.NODE_CAN_ID)
+        self.assertEqual(f["steps"][0], SL.ACTIVE)
+        self.assertEqual(f["veto"], 1)
         states = dict(zip(SL.GROUP_LETTERS, f["states"]))
-        self.assertEqual(states["S"], SL.ACTIVE)
-        self.assertEqual(states["E1"], SL.GOOD)
-        self.assertEqual(states["T"], SL.FAULT)
-        self.assertEqual(states["P"], SL.PENDING)
-        self.assertEqual(f["active_group"], 1)
-        self.assertEqual(f["session_active"], 1)
+        # E1 covers steps 0, 6 and 12. Step 0 is ACTIVE but 6 and 12 have
+        # not run, so the group shows its LEAST advanced step, PENDING.
+        # A group that read ACTIVE here would overstate the work done.
+        self.assertEqual(states["E1"], SL.PENDING)
+        self.assertEqual(states["S"], SL.PENDING)
 
     def test_group_letters_are_the_specified_seven(self):
         self.assertEqual(SL.GROUP_LETTERS,
@@ -89,13 +177,13 @@ class TestLinkState(unittest.TestCase):
         self.assertEqual(s["frames"], 0)
 
     def test_alive_within_the_threshold_and_stale_after(self):
-        self.link.ingest(100.0, frame(seq=1))
+        self.link.ingest(100.0, display_frame(seq=1))
         self.assertTrue(self.link.snapshot(now=100.0 + SL.STALE_S - 0.01)["alive"])
         self.assertFalse(self.link.snapshot(now=100.0 + SL.STALE_S)["alive"])
 
     def test_period_is_measured_not_assumed(self):
         for i in range(4):
-            self.link.ingest(100.0 + i * 0.5, frame(seq=i))
+            self.link.ingest(100.0 + i * 0.5, display_frame(seq=i))
         s = self.link.snapshot(now=101.5)
         self.assertAlmostEqual(s["period_ms"], 500.0, places=3)
         self.assertAlmostEqual(s["period_avg_ms"], 500.0, places=3)
@@ -103,40 +191,66 @@ class TestLinkState(unittest.TestCase):
 
     def test_continuous_sequence_has_no_gaps(self):
         for i in range(10):
-            self.link.ingest(100.0 + i * 0.5, frame(seq=i))
+            self.link.ingest(100.0 + i * 0.5, display_frame(seq=i))
         s = self.link.snapshot(now=105.0)
         self.assertEqual((s["gaps"], s["repeats"]), (0, 0))
 
     def test_gap_and_repeat_are_counted_separately(self):
-        self.link.ingest(100.0, frame(seq=1))
-        self.link.ingest(100.5, frame(seq=3))      # gap: 2 was missed
-        self.link.ingest(101.0, frame(seq=3))      # repeat: same sequence
+        self.link.ingest(100.0, display_frame(seq=1))
+        self.link.ingest(100.5, display_frame(seq=3))   # gap: 2 missed
+        self.link.ingest(101.0, display_frame(seq=3))   # repeat
         s = self.link.snapshot(now=101.0)
         self.assertEqual(s["gaps"], 1)
         self.assertEqual(s["repeats"], 1)
 
     def test_wrap_is_continuous_not_a_gap(self):
         """255 -> 0 is the normal 8-bit roll, not a lost frame."""
-        self.link.ingest(100.0, frame(seq=255))
-        self.link.ingest(100.5, frame(seq=0))
+        self.link.ingest(100.0, display_frame(seq=255))
+        self.link.ingest(100.5, display_frame(seq=0))
         self.assertEqual(self.link.snapshot(now=100.5)["gaps"], 0)
 
     def test_bad_length_counted_and_does_not_disturb_continuity(self):
-        self.link.ingest(100.0, frame(seq=1))
+        self.link.ingest(100.0, display_frame(seq=1))
         self.link.ingest(100.5, b"\x01\x02\x03")
-        self.link.ingest(101.0, frame(seq=2))
+        self.link.ingest(101.0, display_frame(seq=2))
         s = self.link.snapshot(now=101.0)
         self.assertEqual(s["bad_dlc"], 1)
         self.assertEqual(s["frames"], 2)
         self.assertEqual(s["gaps"], 0)
 
-    def test_snapshot_exposes_decoded_states(self):
-        self.link.ingest(100.0, frame(seq=1, lo=0x21, hi=0x03))
+    def test_the_display_link_exposes_no_group_states(self):
+        """Only the status frame carries steps. The screen handles None."""
+        self.link.ingest(100.0, display_frame(seq=1))
+        self.assertIsNone(self.link.snapshot(now=100.1)["states"])
+
+
+class TestNodeLinkState(unittest.TestCase):
+    def setUp(self):
+        self.link = SL.LinkState(SL.NODE_CAN_ID, "NODE")
+
+    def test_snapshot_exposes_the_group_rollup(self):
+        data = node_frame(steps={1: SL.GOOD, 2: SL.GOOD, 3: SL.GOOD,
+                                 9: SL.FAULT})
+        self.link.ingest(100.0, data)
         s = self.link.snapshot(now=100.1)
-        self.assertEqual(s["states"][0], SL.ACTIVE)
-        self.assertEqual(s["states"][4], SL.FAULT)
-        self.assertEqual(s["data"],
-                         bytes([1, 1, 1, 0x11, 0x21, 0x03, 0, 1]))
+        self.assertEqual(s["states"][0], SL.GOOD)    # S covers 1,2,3
+        self.assertEqual(s["states"][4], SL.FAULT)   # T covers 9
+        self.assertEqual(s["data"], data)
+
+    def test_the_status_frame_counts_no_gap_and_no_repeat(self):
+        """It carries no counter, so continuity cannot be judged on it."""
+        for i in range(6):
+            self.link.ingest(100.0 + i * 0.2, node_frame(steps={0: SL.ACTIVE}))
+        s = self.link.snapshot(now=101.2)
+        self.assertEqual((s["gaps"], s["repeats"]), (0, 0))
+        self.assertIsNone(s["sequence"])
+        self.assertEqual(s["frames"], 6)
+
+    def test_the_measured_period_is_two_hundred_milliseconds(self):
+        for i in range(5):
+            self.link.ingest(100.0 + i * 0.2, node_frame())
+        s = self.link.snapshot(now=100.8)
+        self.assertAlmostEqual(s["period_avg_ms"], 200.0, places=3)
 
 
 class TestIds(unittest.TestCase):
