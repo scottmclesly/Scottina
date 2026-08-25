@@ -422,6 +422,98 @@ class SpecterScreen(Screen):
             d.text((x0 + cw / 2 - sw / 2, y + 24), si, font=sf, fill=sc)
         return y + h
 
+    def _steps_strip(self, d, th, y):
+        """All 13 steps as one strip: colour is state, number is the step.
+
+        Thirteen cells across 480 pixels is 33 each, so the cell carries the
+        step NUMBER and the state colour. The name of the step under the
+        cursor is written under the strip, because a number alone means
+        nothing across a bench.
+        """
+        w = self.app.w
+        _disp, node = self._snap
+        nf = node.get("fields") or {}
+        steps = nf.get("steps") or []
+        n = SL.STEPS_IN_USE
+        gap = 2
+        cw = (w - 28 - gap * (n - 1)) / n
+        h = 26
+
+        for i in range(n):
+            x0 = 14 + i * (cw + gap)
+            box = (x0, y, x0 + cw, y + h)
+            value = steps[i] if i < len(steps) else None
+            if value is None:
+                d.rectangle(box, outline=th.card_hi, width=1)
+                continue
+            col = self._state_colour(th, value)
+            if value == SL.PENDING:
+                d.rectangle(box, outline=col, width=1)
+                tc = th.muted
+            else:
+                d.rectangle(box, fill=col)
+                tc = th.ink
+            f = T.font(11, bold=True, mono=True)
+            label = "%d" % i
+            lw_ = d.textlength(label, font=f)
+            d.text((x0 + cw / 2 - lw_ / 2, y + 6), label, font=f, fill=tc)
+        return y + h
+
+    def _specter_lines(self, d, th, y):
+        """The lines that say what the checklist is doing, in words."""
+        w = self.app.w
+        disp, node = self._snap
+        df = disp.get("fields") or {}
+        nf = node.get("fields") or {}
+        hs_req, hs_rsp = getattr(self, "_hs", (None, None))
+        f = T.font(T.HINT, mono=True)
+
+        def line(text, colour):
+            nonlocal y
+            d.text((14, y), text[:62], font=f, fill=colour)
+            y += 12
+
+        if df:
+            line("STATE  %s" % SL.display_state_name(df.get("display_state", 0)),
+                 th.fg)
+        else:
+            line("STATE  no display frame", th.muted)
+
+        if nf:
+            good = sum(1 for s in nf.get("steps", []) if s == SL.GOOD)
+            veto = bool(nf.get("veto"))
+            line("VETO   %s   %d of %d steps GOOD"
+                 % ("SET" if veto else "CLEAR", good, SL.STEPS_IN_USE),
+                 th.warn if veto else th.ok)
+            shore = nf.get("shore_link")
+            if shore is not None:
+                line("SHORE  slot 13 %s   (not a checklist step)"
+                     % SL.STATE_NAMES[shore],
+                     th.ok if shore == SL.GOOD else th.muted)
+
+        seq = df.get("event_sequence", 0) if df else 0
+        if seq:
+            echo = nf.get("event_echo") if nf else None
+            step = df.get("step_index", 0xFF)
+            line("EVENT  %s  %s  echo %s"
+                 % (SL.event_type_name(df.get("event_type", 0)),
+                    "step %s" % ("none" if step == 0xFF else SL.step_name(step)),
+                    "cleared" if echo == seq else "OUT"),
+                 th.fg)
+        else:
+            line("EVENT  none outstanding", th.muted)
+
+        if hs_rsp and hs_rsp.get("fields"):
+            g = hs_rsp["fields"]
+            line("HSHAKE %s  checklist 0x%04X  session %d"
+                 % (g["result_text"], g["checklist_id"], g["session_id"]),
+                 th.ok if g["result"] == 0 else th.bad)
+        if hs_req and hs_req.get("fields"):
+            g = hs_req["fields"]
+            line("BUILD  firmware %s" % g["firmware_text"],
+                 th.warn if g["firmware_id"] == 0 else th.fg)
+        return y
+
     def _section(self, d, th, y, snap, who):
         w = self.app.w
         d.text((14, y), spaced(snap["label"]),
@@ -451,6 +543,12 @@ class SpecterScreen(Screen):
         y += 8
         y = self._section(d, th, y, node, "the boat side talks")
         y += 8
+
+        # ---- the SPECTER state: the strip, then the words ----
+        y = self._steps_strip(d, th, y)
+        y += 4
+        y = self._specter_lines(d, th, y)
+        y += 4
 
         # ---- bus card ----
         b = self.bus

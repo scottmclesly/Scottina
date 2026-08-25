@@ -109,7 +109,7 @@ try:
         encode_status_frame,
         step_name,
     )
-    from specter_pkg.tocan_codec import encode_physical
+    from specter_pkg.tocan_codec import encode_physical, encode_raw
     from specter_pkg.tocan_ids import ToCanTid
     from specter_pkg.tocan_ids import (
         DISPLAY_CAN_SOURCE,
@@ -201,7 +201,13 @@ NMEA_SOURCE = 0x83
 YANMAR_SOURCE = 0x82
 
 TELEMETRY_PERIOD_S = 1.0
-TELEMETRY_FAST_PERIOD_S = 0.1          # the 10 Hz messages
+TELEMETRY_FAST_PERIOD_S = 0.1
+
+TID_VOLTAGE = 0x1401
+TID_RELAY_STATE = 0x1400
+# Both come from a ToCAN device. The Switching ToCAN device, 0x81, owns the
+# relays and the power management sensors. Source: BEN_TOCAN_SOURCE_IDS.md.
+SWITCHING_SOURCE = 0x81          # the 10 Hz messages
 
 # --------------------------------------------------------------------------
 # The full vessel telemetry table.
@@ -222,6 +228,31 @@ TELEMETRY_FAST_PERIOD_S = 0.1          # the 10 Hz messages
 # demonstration cannot wander out of a sane range.
 #
 # (tid, source, field, centre, swing, period_s, label)
+# 0x1401 Voltage Measurement carries a Voltage Source ID, so ONE TID reports
+# several sources. The specification warns that some devices report more
+# sources than exist and that certain ones must be ignored, and nothing names
+# which id is the battery. So the rig sends a plausible SET of ids and the
+# panel lists every one it sees with its value. Scott picks the right one by
+# looking at the bench, which is a five second answer.
+#
+# (voltage_source_id, label, centre volts, swing volts)
+VOLTAGE_SOURCES = (
+    (1, "start battery", 12.60, 0.25),
+    (2, "house bank", 12.85, 0.20),
+    (3, "alternator output", 14.35, 0.30),
+    (7, "spare sender, ignore", 0.00, 0.00),
+)
+
+# 0x1400 Relay State Feedback. Bank 1 carries the engine room relays. The
+# BANK and RELAY IDS FOR THE BLOWERS, THE PUMPS AND THE LIGHTS ARE NOT IN
+# can_node.cpp AND NOT IN THE MARVIN TREE, so the rig sends a bank and the
+# panel shows the bank and relay ids. Scott reads the ids off the bench.
+# (bank_id, initial_relay_id, six states)
+RELAY_BANKS = (
+    (1, 1, (1, 1, 0, 0, 1, 0)),
+    (2, 7, (0, 2, 1, 0xFF, 0xFF, 0xFF)),
+)
+
 TELEMETRY_TABLE = (
     (0x5000, NMEA_SOURCE,   'fuel_level',            78.0,  None, 1.0,
      'fuel level %'),
@@ -614,6 +645,42 @@ class TelemetryState:
                     self.values[(0x1805, 'potential')],
                     self.wiggle)
 
+    def voltage_frames(self):
+        """One 0x1401 frame for each voltage source id."""
+        out = []
+        for source_id, label, centre, swing in VOLTAGE_SOURCES:
+            with self.lock:
+                elapsed = self.elapsed
+                wiggle = self.wiggle
+            volts = centre
+            if wiggle and swing:
+                phase = (elapsed / VOLTS_PERIOD_S) * 2.0 * math.pi
+                phase += float(source_id) * 1.3
+                volts = centre + swing * math.sin(phase)
+            millivolts = int(round(volts * 1000.0))
+            data = encode_raw(TID_VOLTAGE,
+                              voltage_source_id=source_id,
+                              voltage=millivolts)
+            out.append((((TID_VOLTAGE << 8) | SWITCHING_SOURCE), data,
+                        volts, "voltage id %d, %s" % (source_id, label),
+                        TID_VOLTAGE, SWITCHING_SOURCE))
+        return out
+
+    def relay_frames(self):
+        """One 0x1400 frame for each relay bank."""
+        out = []
+        for bank_id, initial, states in RELAY_BANKS:
+            fields = {"bank_id": bank_id, "initial_relay_id": initial}
+            for index, value in enumerate(states):
+                fields["relay_state_%d" % index] = value
+            data = encode_raw(TID_RELAY_STATE, **fields)
+            out.append((((TID_RELAY_STATE << 8) | SWITCHING_SOURCE), data,
+                        float(bank_id),
+                        "relay bank %d, relays %d to %d"
+                        % (bank_id, initial, initial + 5),
+                        TID_RELAY_STATE, SWITCHING_SOURCE))
+        return out
+
     def frames(self, period_s=None):
         """Build the telemetry frames. Return one tuple for each message.
 
@@ -665,7 +732,12 @@ def telemetry_worker(sock, tx_lock, telemetry, stop_event, link):
             groups.append(TELEMETRY_PERIOD_S)
 
         for period in groups:
-            for can_id, data, _v, _label, _tid, _src in telemetry.frames(period):
+            batch = list(telemetry.frames(period))
+            if period == TELEMETRY_PERIOD_S:
+                # Both are 1 Hz in the specification.
+                batch.extend(telemetry.voltage_frames())
+                batch.extend(telemetry.relay_frames())
+            for can_id, data, _v, _label, _tid, _src in batch:
                 try:
                     with tx_lock:
                         send_frame(sock, can_id, data)
