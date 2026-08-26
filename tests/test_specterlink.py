@@ -167,6 +167,53 @@ class TestDecode(unittest.TestCase):
                          ("S", "P", "E1", "C", "T", "E2", "R"))
 
 
+class TestTheBuildFlags(unittest.TestCase):
+    """Byte 4 of the handshake request names the image on the unit.
+
+    The display was flashed from a working tree that was not origin. Nothing
+    on the wire said so, and three unrelated-looking symptoms all came from
+    that one cause. This byte turns that day of chasing into one line.
+    """
+
+    @staticmethod
+    def hs(flags=0, major=0x0C, minor=0xEF):
+        return bytes([1, major, minor, 24, flags, 0, 0, 0])
+
+    def test_a_clean_image_reads_clean(self):
+        f = SL.decode_hs_request(self.hs(0))
+        self.assertTrue(f["build_clean"])
+        self.assertIn("CLEAN", f["build_text"])
+        self.assertIn("0cef", f["build_text"])
+
+    def test_a_dirty_image_shouts(self):
+        f = SL.decode_hs_request(self.hs(SL.BUILD_DIRTY))
+        self.assertFalse(f["build_clean"])
+        self.assertIn("DIRTY", f["build_text"])
+        self.assertIn("***", f["build_text"])
+
+    def test_dirty_and_behind_are_both_named(self):
+        f = SL.decode_hs_request(self.hs(SL.BUILD_DIRTY | SL.BUILD_BEHIND))
+        self.assertIn("DIRTY", f["build_text"])
+        self.assertIn("BEHIND", f["build_text"])
+
+    def test_an_unknown_identity_never_shows_a_plausible_commit(self):
+        f = SL.decode_hs_request(self.hs(SL.BUILD_ID_UNKNOWN, 0, 0))
+        self.assertIn("unknown", f["build_text"])
+        self.assertNotIn("0000", f["build_text"])
+
+    def test_the_flag_values(self):
+        self.assertEqual(SL.BUILD_DIRTY, 0x01)
+        self.assertEqual(SL.BUILD_BEHIND, 0x02)
+        self.assertEqual(SL.BUILD_ID_UNKNOWN, 0x04)
+        self.assertEqual(SL.BUILD_REMOTE_STALE, 0x08)
+
+    def test_the_other_request_fields_still_decode(self):
+        f = SL.decode_hs_request(self.hs(0x03))
+        self.assertEqual(f["protocol_version"], 1)
+        self.assertEqual(f["step_capacity"], 24)
+        self.assertEqual(f["firmware_text"], "0x0CEF")
+
+
 class TestTheEventParameter(unittest.TestCase):
     """Byte 5 names WHICH payload hatch an actuate event drives.
 

@@ -280,6 +280,13 @@ class SpecterScreen(Screen):
                              f["step_capacity"])),
                 "state": "caution" if f["firmware_id"] == 0 else None,
             })
+            # THE BUILD LINE. Read it before any symptom on the display: a
+            # dirty or behind image explains every one of them at once.
+            rows.append({
+                "label": "BUILD",
+                "value": f.get("build_text", "unknown"),
+                "state": None if f.get("build_clean") else "fault",
+            })
         if hs_rsp and hs_rsp.get("fields"):
             f = hs_rsp["fields"]
             rows.append({
@@ -512,8 +519,8 @@ class SpecterScreen(Screen):
                  th.ok if g["result"] == 0 else th.bad)
         if hs_req and hs_req.get("fields"):
             g = hs_req["fields"]
-            line("BUILD  firmware %s" % g["firmware_text"],
-                 th.warn if g["firmware_id"] == 0 else th.fg)
+            line("BUILD  %s" % g.get("build_text", "unknown"),
+                 th.fg if g.get("build_clean") else th.bad)
         return y
 
     def _section(self, d, th, y, snap, who):

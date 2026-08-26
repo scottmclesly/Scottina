@@ -15,6 +15,10 @@ little-endian. They no longer share one layout. Each id has its own:
     byte 4 display_state      byte 5 event_param
     bytes 6 to 7 reserved
 
+    can_id 0x240320  handshake request   the Screen asks    1000 ms
+    byte 0 protocol   bytes 1 to 2 firmware identity
+    byte 3 step_capacity   byte 4 BUILD FLAGS   bytes 5 to 7 reserved
+
     can_id 0x248021   status frame    the boat side talks  200 ms
     byte 0 flags   bit0 veto, bit1 operator_input_requested,
                    bits2-3 vessel_mode, bits4-7 event_echo
@@ -174,6 +178,45 @@ def hs_result_name(value):
     return "UNDEFINED %d" % value
 
 
+#: Byte 4 of the handshake request. EVERY BIT MEANS SOMETHING IS WRONG WITH
+#: THE IMAGE ON THE UNIT.
+#:
+#: The display was flashed from a working tree that was not origin. Nothing
+#: on the wire said so, and three unrelated-looking symptoms all came from
+#: that one cause. This byte is what makes it one line instead of a day.
+BUILD_DIRTY = 0x01
+BUILD_BEHIND = 0x02
+BUILD_ID_UNKNOWN = 0x04
+BUILD_REMOTE_STALE = 0x08
+
+_BUILD_FLAGS = (
+    (BUILD_DIRTY, "DIRTY"),
+    (BUILD_BEHIND, "BEHIND"),
+    (BUILD_ID_UNKNOWN, "ID UNKNOWN"),
+    (BUILD_REMOTE_STALE, "REMOTE STALE"),
+)
+
+
+def build_flag_names(flags):
+    """Name every build flag set. An empty list means the image is clean."""
+    return [name for bit, name in _BUILD_FLAGS if flags & bit]
+
+
+def build_identity_text(major, minor, flags):
+    """One line naming the image on the unit and what is wrong with it.
+
+    READ THIS BEFORE BELIEVING ANY SYMPTOM ON THE DISPLAY. A stale image
+    explains all of them at once, and chasing them one at a time does not.
+    """
+    commit = "%02x%02x" % (major, minor)
+    if flags & BUILD_ID_UNKNOWN:
+        commit = "unknown"
+    names = build_flag_names(flags)
+    if not names:
+        return "commit %s CLEAN" % commit
+    return "commit %s *** %s ***" % (commit, ", ".join(names))
+
+
 def decode_hs_request(data):
     """Decode the handshake request, 0x240320.
 
@@ -184,11 +227,16 @@ def decode_hs_request(data):
     if data is None or len(data) != 8:
         return None
     fw = (data[1] << 8) | data[2]
+    flags = data[4]
     return {
         "protocol_version": data[0],
         "firmware_id": fw,
         "firmware_text": ("none" if fw == 0 else "0x%04X" % fw),
         "step_capacity": data[3],
+        # BYTE 4 IS THE BUILD FLAGS. It was reserved and always sent 0.
+        "build_flags": flags,
+        "build_text": build_identity_text(data[1], data[2], flags),
+        "build_clean": flags == 0,
         # LinkState reads these on every frame. The handshake pair
         # carries no counter and no step states.
         "sequence": None,
