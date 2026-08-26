@@ -99,6 +99,7 @@ try:
         SPECTER_CHECKLIST_ID,
         SPECTER_STEPS_IN_USE,
         SPECTER_STEP_CAPACITY,
+        SpecterActuateTarget,
         SpecterEventType,
         SpecterHandshakeResult,
         SpecterStepState,
@@ -349,6 +350,33 @@ def group_steps_text(index):
     return " ".join("%d" % step for step in GROUP_STEPS[index])
 
 
+# The payload hatch, step 4. The operator drives it by hand from the display,
+# so this rig must track WHICH hatch was told to move and in WHICH direction.
+# It reports intent. There is no position feedback on the bus.
+HATCH_STEP = 4
+HATCH_STOPPED = 0
+HATCH_OPENING = 1
+HATCH_CLOSING = 2
+HATCH_MOTION_NAMES = {
+    HATCH_STOPPED: "stopped",
+    HATCH_OPENING: "OPENING",
+    HATCH_CLOSING: "CLOSING",
+}
+ACTUATE_EVENTS = {
+    int(SpecterEventType.ACTUATE_UP): HATCH_OPENING,
+    int(SpecterEventType.ACTUATE_DOWN): HATCH_CLOSING,
+    int(SpecterEventType.ACTUATE_STOP): HATCH_STOPPED,
+}
+
+
+def target_name(value):
+    """Give the name of a hatch target, or mark it undefined."""
+    try:
+        return SpecterActuateTarget(value).name
+    except ValueError:
+        return "UNDEFINED_%d" % value
+
+
 def event_name(value):
     """Give the name of an event type, or mark it undefined."""
     try:
@@ -374,6 +402,9 @@ class SimState:
         self.accepted = set()
         self.events_run = 0
         self.handshakes_answered = 0
+        # What the DISPLAY last told each hatch to do. Not where it is.
+        self.hatch_port = HATCH_STOPPED
+        self.hatch_stbd = HATCH_STOPPED
 
     def snapshot(self):
         with self.lock:
@@ -506,10 +537,58 @@ class SimState:
                 self.operator_input_requested = False
         elif event == int(SpecterEventType.STEP_RERUN) and step != 0xFF:
             self.set_step(step, PENDING)
+        elif event in ACTUATE_EVENTS:
+            self._run_actuate(event, fields)
         elif event == int(SpecterEventType.SESSION_ABORT):
             self.set_all(PENDING)
             with self.lock:
                 self.operator_input_requested = False
+                self.hatch_port = HATCH_STOPPED
+                self.hatch_stbd = HATCH_STOPPED
+
+    def _run_actuate(self, event, fields):
+        """Drive the payload hatches from one actuate event.
+
+        Byte 5 names the target: 0 both, 1 port, 2 starboard. The step is
+        NOT confirmed by any of this. Only STEP_CONFIRM marks it GOOD, and
+        only the operator sends that.
+        """
+        motion = ACTUATE_EVENTS[event]
+        target = fields.get("event_param", 0)
+        step = fields["step_index"]
+
+        if step != HATCH_STEP:
+            say("REFUSED: %s is for step %d, the payload hatch. It arrived "
+                "on step %s." % (event_name(event), HATCH_STEP, step))
+            return
+        if target not in {int(x) for x in SpecterActuateTarget}:
+            say("REFUSED: hatch target %d is not defined." % target)
+            return
+
+        with self.lock:
+            if target in (int(SpecterActuateTarget.BOTH),
+                          int(SpecterActuateTarget.PORT)):
+                self.hatch_port = motion
+            if target in (int(SpecterActuateTarget.BOTH),
+                          int(SpecterActuateTarget.STARBOARD)):
+                self.hatch_stbd = motion
+            port = self.hatch_port
+            stbd = self.hatch_stbd
+
+        say("HATCH %s %s -> port %s, starboard %s"
+            % (event_name(event), target_name(target),
+               HATCH_MOTION_NAMES[port], HATCH_MOTION_NAMES[stbd]))
+
+    def hatch_text(self):
+        """One line saying what the display last told the hatches to do."""
+        with self.lock:
+            port = self.hatch_port
+            stbd = self.hatch_stbd
+        if (port == HATCH_STOPPED) and (stbd == HATCH_STOPPED):
+            return "hatches stopped"
+        return ("hatches: port %s, starboard %s  (intent only, no position "
+                "feedback on the bus)"
+                % (HATCH_MOTION_NAMES[port], HATCH_MOTION_NAMES[stbd]))
 
     def build_frame(self, advance=False):
         """Build the 8 status bytes. Return the bytes and the fields.
@@ -831,6 +910,15 @@ def format_display_frame(title, can_id, data, fields):
     else:
         lines.append("  byte 3 step_index        : %d OUT OF RANGE" % step)
     lines.append("  byte 4 display_state     : %d" % fields["display_state"])
+    param = fields.get("event_param", 0)
+    if fields["event_type"] in ACTUATE_EVENTS:
+        lines.append("  byte 5 event_param       : %d hatch %s"
+                     % (param, target_name(param)))
+    elif param:
+        lines.append("  byte 5 event_param       : %d SET ON AN EVENT THAT "
+                     "CARRIES NONE" % param)
+    else:
+        lines.append("  byte 5 event_param       : 0 none")
     return "\n".join(lines)
 
 
@@ -1072,6 +1160,7 @@ def show_outgoing(state, reason):
     lines.append("  slot %d shore link : %d %s"
                  % (SHORE_LINK_SLOT, fields["shore_link"],
                     STEP_STATES[fields["shore_link"]]))
+    lines.append("  payload hatch : %s" % state.hatch_text())
     lines.append("  cansend form: %08X#%s"
                  % (TX_CAN_ID, "".join("%02X" % b for b in data)))
     say("\n".join(lines))

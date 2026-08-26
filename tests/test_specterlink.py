@@ -23,9 +23,11 @@ from kilodash import specterlink as SL  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def display_frame(seq=0, event_seq=0, event_type=0, step=0xFF, state=0):
+def display_frame(seq=0, event_seq=0, event_type=0, step=0xFF, state=0,
+                  event_param=0):
     """Build one display frame, 0x240220. Byte 0 is the liveness counter."""
-    return bytes([seq, event_seq & 0x0F, event_type, step, state, 0, 0, 0])
+    return bytes([seq, event_seq & 0x0F, event_type, step, state,
+                  event_param, 0, 0])
 
 
 def node_frame(steps=None, veto=1, operator_input=0, mode=0, echo=0,
@@ -163,6 +165,45 @@ class TestDecode(unittest.TestCase):
     def test_group_letters_are_the_specified_seven(self):
         self.assertEqual(SL.GROUP_LETTERS,
                          ("S", "P", "E1", "C", "T", "E2", "R"))
+
+
+class TestTheEventParameter(unittest.TestCase):
+    """Byte 5 names WHICH payload hatch an actuate event drives.
+
+    The panel must show the target, because ACTUATE UP on its own does not
+    say what moves. It must NOT show a target on any other event, because
+    byte 5 carries no meaning there.
+    """
+
+    def test_byte_5_is_decoded(self):
+        frame = display_frame(seq=5, event_seq=3, event_type=8, step=4,
+                              state=2, event_param=1)
+        self.assertEqual(SL.decode_display(frame)["event_param"], 1)
+
+    def test_an_actuate_event_names_its_hatch(self):
+        self.assertEqual(SL.event_detail(8, 0), "ACTUATE UP BOTH")
+        self.assertEqual(SL.event_detail(8, 1), "ACTUATE UP PORT")
+        self.assertEqual(SL.event_detail(9, 2), "ACTUATE DOWN STARBOARD")
+        self.assertEqual(SL.event_detail(10, 0), "ACTUATE STOP BOTH")
+
+    def test_every_other_event_names_no_hatch(self):
+        # STEP BEGIN with a stray byte 5 must still read STEP BEGIN. The
+        # parameter has no meaning on it, so inventing one would mislead.
+        self.assertEqual(SL.event_detail(2, 0), "STEP BEGIN")
+        self.assertEqual(SL.event_detail(2, 1), "STEP BEGIN")
+        self.assertEqual(SL.event_detail(5, 2), "STEP ABORT")
+
+    def test_an_undefined_target_is_named_undefined(self):
+        self.assertEqual(SL.event_detail(8, 7), "ACTUATE UP UNDEFINED 7")
+
+    def test_the_three_event_values_did_not_move_anything(self):
+        # No existing event changed value. This is what makes the wire
+        # change safe: every frame that worked before still decodes the same.
+        self.assertEqual(SL.event_type_name(5), "STEP ABORT")
+        self.assertEqual(SL.event_type_name(7), "SESSION COMPLETE")
+        self.assertEqual(SL.event_type_name(8), "ACTUATE UP")
+        self.assertEqual(SL.event_type_name(9), "ACTUATE DOWN")
+        self.assertEqual(SL.event_type_name(10), "ACTUATE STOP")
 
 
 class TestLinkState(unittest.TestCase):

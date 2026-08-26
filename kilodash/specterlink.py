@@ -12,7 +12,8 @@ little-endian. They no longer share one layout. Each id has its own:
     can_id 0x240220   display frame   the Screen talks     500 ms
     byte 0 liveness_counter   byte 1 event_sequence
     byte 2 event_type         byte 3 step_index
-    byte 4 display_state      bytes 5 to 7 reserved
+    byte 4 display_state      byte 5 event_param
+    bytes 6 to 7 reserved
 
     can_id 0x248021   status frame    the boat side talks  200 ms
     byte 0 flags   bit0 veto, bit1 operator_input_requested,
@@ -91,7 +92,14 @@ DISPLAY_STATES = ("BLOCKED", "PIN", "RUNNING", "STALE", "FAULT REVIEW")
 
 #: Byte 2 of the display frame.
 EVENT_TYPES = ("NONE", "SESSION BEGIN", "STEP BEGIN", "STEP CONFIRM",
-               "STEP RERUN", "STEP ABORT", "SESSION ABORT", "SESSION COMPLETE")
+               "STEP RERUN", "STEP ABORT", "SESSION ABORT", "SESSION COMPLETE",
+               "ACTUATE UP", "ACTUATE DOWN", "ACTUATE STOP")
+
+#: The three events that carry a parameter in byte 5. Nothing else does.
+ACTUATE_EVENTS = (8, 9, 10)
+
+#: Byte 5, on an actuate event only. Which payload hatch it drives.
+ACTUATE_TARGETS = ("BOTH", "PORT", "STARBOARD")
 
 #: Byte 1 of the handshake response.
 HS_RESULTS = ("ACCEPT", "REJECT PROTOCOL", "REJECT CAPACITY",
@@ -139,6 +147,25 @@ def event_type_name(value):
     if 0 <= value < len(EVENT_TYPES):
         return EVENT_TYPES[value]
     return "UNDEFINED %d" % value
+
+
+def actuate_target_name(value):
+    """Name the hatch an actuate event drives. Byte 5."""
+    if 0 <= value < len(ACTUATE_TARGETS):
+        return ACTUATE_TARGETS[value]
+    return "UNDEFINED %d" % value
+
+
+def event_detail(event_type, event_param):
+    """Name one event, with its target when it carries one.
+
+    Only the three actuate events use byte 5. Every other event leaves it 0,
+    so showing it on them would invent a meaning the wire does not have.
+    """
+    name = event_type_name(event_type)
+    if event_type in ACTUATE_EVENTS:
+        return "%s %s" % (name, actuate_target_name(event_param))
+    return name
 
 
 def hs_result_name(value):
@@ -252,6 +279,10 @@ def decode_display(data):
         "event_type": data[2],
         "step_index": data[3],
         "display_state": data[4],
+        # BYTE 5 IS THE EVENT PARAMETER. It names which payload hatch an
+        # actuate event drives: 0 both, 1 port, 2 starboard. Every other
+        # event leaves it 0.
+        "event_param": data[5],
         "states": None,               # the display frame carries no steps
     }
 

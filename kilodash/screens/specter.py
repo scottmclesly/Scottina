@@ -225,7 +225,8 @@ class SpecterScreen(Screen):
                     "label": "EVENT",
                     "value": "seq %d  %s  step %s  echo %s"
                              % (seq,
-                                SL.event_type_name(df.get("event_type", 0)),
+                                SL.event_detail(df.get("event_type", 0),
+                                                df.get("event_param", 0)),
                                 ("none" if df.get("step_index") == 0xFF
                                  else SL.step_name(df.get("step_index", 0))),
                                 ("cleared" if cleared else "outstanding")),
@@ -496,7 +497,8 @@ class SpecterScreen(Screen):
             echo = nf.get("event_echo") if nf else None
             step = df.get("step_index", 0xFF)
             line("EVENT  %s  %s  echo %s"
-                 % (SL.event_type_name(df.get("event_type", 0)),
+                 % (SL.event_detail(df.get("event_type", 0),
+                                    df.get("event_param", 0)),
                     "step %s" % ("none" if step == 0xFF else SL.step_name(step)),
                     "cleared" if echo == seq else "OUT"),
                  th.fg)

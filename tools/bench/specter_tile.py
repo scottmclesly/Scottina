@@ -452,11 +452,23 @@ def build_tile(interface, started, state, rx_stats, tx_stats, health, log,
         lines.append("   %-9sliveness %d  display_state %d"
                      % ("header", fields["liveness_counter"],
                         fields["display_state"]))
-        lines.append("   %-9sseq %d  type %d %s  step %s"
+        # Byte 5 names WHICH payload hatch an actuate event drives. It has
+        # no meaning on any other event, so it is shown on no other event.
+        event_type = fields["event_type"]
+        param = fields.get("event_param", 0)
+        target_text = ""
+        if event_type in specter_sim.ACTUATE_EVENTS:
+            target_text = "  hatch %s" % specter_sim.target_name(param)
+        lines.append("   %-9sseq %d  type %d %s  step %s%s"
                      % ("event", fields["event_sequence"],
-                        fields["event_type"],
-                        specter_sim.event_name(fields["event_type"]),
-                        step_text))
+                        event_type,
+                        specter_sim.event_name(event_type),
+                        step_text, target_text))
+        # There is no hatch row here on purpose. THIS TILE IS A VIEWER: its
+        # receive loop writes counters and never applies an event, so the
+        # rig's hatch state would read "stopped" whatever arrives. The
+        # target above is read straight from byte 5 of the frame in hand,
+        # so it is true. Run specter_sim.py to drive the hatch state.
         lines.append("   %-9s%s" % ("raw", format_raw(rx["data"])))
         # The display frame carries no step states. Only the status frame
         # does, and this rig is the one that sends it. The TX panel below
