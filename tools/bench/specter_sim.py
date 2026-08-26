@@ -237,9 +237,10 @@ SWITCHING_SOURCE = 0x81          # the 10 Hz messages
 #
 # (voltage_source_id, label, centre volts, swing volts)
 VOLTAGE_SOURCES = (
-    (1, "start battery", 12.60, 0.25),
-    (2, "house bank", 12.85, 0.20),
-    (3, "alternator output", 14.35, 0.30),
+    # ID 1 IS THE BATTERY. The display reads this one for every battery gauge.
+    (1, "start battery", 12.60, 0.60),      # 12.00 to 13.20 V
+    (2, "house bank", 12.85, 0.45),         # 12.40 to 13.30 V
+    (3, "alternator output", 14.35, 0.40),  # 13.95 to 14.75 V
     (7, "spare sender, ignore", 0.00, 0.00),
 )
 
@@ -254,28 +255,31 @@ RELAY_BANKS = (
 )
 
 TELEMETRY_TABLE = (
-    (0x5000, NMEA_SOURCE,   'fuel_level',            78.0,  None, 1.0,
-     'fuel level %'),
-    (0x1805, YANMAR_SOURCE, 'potential',             14.40, 0.35, 1.0,
-     'alternator potential V'),
-    (0x1800, YANMAR_SOURCE, 'rpm',                  850.0, 60.0,  0.1,
-     'engine rpm'),
-    (0x1801, YANMAR_SOURCE, 'tilt_trim',              4.0,  3.0,  1.0,
-     'engine tilt/trim deg'),
-    (0x1803, YANMAR_SOURCE, 'oil_temperature',       92.0,  3.0,  1.0,
-     'engine oil temperature degC'),
-    (0x1804, YANMAR_SOURCE, 'engine_temperature',    82.0,  3.0,  1.0,
-     'engine temperature degC'),
-    (0x1806, YANMAR_SOURCE, 'fuel_rate',              0.012, 0.004, 1.0,
-     'fuel rate m^3/h'),
-    (0x1807, YANMAR_SOURCE, 'engine_seconds',   4460400.0,  None, 1.0,
-     'engine hours s'),
-    (0x180A, YANMAR_SOURCE, 'percent_engine_load',   35.0,  8.0,  1.0,
-     'engine load %'),
-    (0x180B, YANMAR_SOURCE, 'percent_engine_torque', 30.0,  8.0,  1.0,
-     'engine torque %'),
-    (0x180F, YANMAR_SOURCE, 'oil_temperature',       70.0,  3.0,  0.1,
-     'transmission oil temperature degC'),
+    # (tid, source, field, centre, swing, rate, label)
+    # centre +/- swing is the whole band the value moves in. Every band below
+    # is a value the vessel could really show.
+    (0x5000, NMEA_SOURCE,   'fuel_level',            65.0,  10.0,  1.0,
+     'fuel level %'),                       # 55 to 75 %
+    (0x1805, YANMAR_SOURCE, 'potential',             14.40,  0.50, 1.0,
+     'alternator potential V'),             # 13.90 to 14.90 V
+    (0x1800, YANMAR_SOURCE, 'rpm',                 1200.0, 400.0,  0.1,
+     'engine rpm'),                         # 800 to 1600 rpm
+    (0x1801, YANMAR_SOURCE, 'tilt_trim',              4.0,   4.0,  1.0,
+     'engine tilt/trim deg'),               # 0 to 8 deg
+    (0x1803, YANMAR_SOURCE, 'oil_temperature',       92.0,   5.0,  1.0,
+     'engine oil temperature degC'),        # 87 to 97 degC
+    (0x1804, YANMAR_SOURCE, 'engine_temperature',    82.0,   5.0,  1.0,
+     'engine temperature degC'),            # 77 to 87 degC
+    (0x1806, YANMAR_SOURCE, 'fuel_rate',              0.012, 0.006, 1.0,
+     'fuel rate m^3/h'),                    # 0.006 to 0.018
+    (0x1807, YANMAR_SOURCE, 'engine_seconds',   4460400.0,  None,  1.0,
+     'engine hours s'),                     # an hour meter never moves back
+    (0x180A, YANMAR_SOURCE, 'percent_engine_load',   35.0,  20.0,  1.0,
+     'engine load %'),                      # 15 to 55 %
+    (0x180B, YANMAR_SOURCE, 'percent_engine_torque', 30.0,  18.0,  1.0,
+     'engine torque %'),                    # 12 to 48 %
+    (0x180F, YANMAR_SOURCE, 'oil_temperature',       70.0,   5.0,  0.1,
+     'transmission oil temperature degC'),  # 65 to 75 degC
 )
 
 # The scales are NOT repeated here. They come from the shared codec, which
@@ -288,6 +292,23 @@ VOLTS_MAX = 15.0
 # The wiggle. Fuel drifts DOWN over minutes, as a tank does. Voltage moves in
 # a narrow band around a charging alternator. Both are bounded, so a long
 # demonstration cannot wander out of a sane range.
+# THE WIGGLE IS FOR A DEMONSTRATION. It must read as alive within a few
+# seconds of someone looking at it, without being told to wait. Fuel drifting
+# down over minutes was invisible.
+#
+# Every value is a SINE about its centre. A sine is bounded by construction,
+# so no value can wander out of its plausible range however long the rig runs.
+# Each one gets a different phase so they do not all move as one.
+#
+# A ten second cycle means a value crosses its whole band twice a minute and
+# is visibly moving at every glance.
+WIGGLE_PERIOD_S = 10.0
+
+# The operator turns the whole wiggle up or down with `wiggle <gain>`. 0 holds
+# every value steady, which is what you want while explaining a reading.
+WIGGLE_GAIN_DEFAULT = 1.0
+WIGGLE_GAIN_MAX = 3.0
+
 FUEL_DRIFT_PERCENT_PER_SECOND = 0.05
 FUEL_WIGGLE_FLOOR = 15.0
 VOLTS_CENTRE = 14.4
@@ -589,6 +610,7 @@ class TelemetryState:
     def __init__(self, fuel_percent=78.0, volts=VOLTS_CENTRE, wiggle=True):
         self.lock = threading.Lock()
         self.wiggle = wiggle
+        self.gain = WIGGLE_GAIN_DEFAULT
         self.elapsed = 0.0
         self.values = {}
         for tid, _src, field, centre, _swing, _rate, _label in TELEMETRY_TABLE:
@@ -617,6 +639,25 @@ class TelemetryState:
             self.wiggle = bool(on)
             return self.wiggle
 
+    def set_gain(self, gain):
+        """Turn the whole wiggle up or down. 0 holds every value steady."""
+        with self.lock:
+            self.gain = max(0.0, min(WIGGLE_GAIN_MAX, float(gain)))
+            self.wiggle = self.gain > 0.0
+            return self.gain
+
+    def wiggled(self, centre, swing, seed):
+        """A bounded sine about `centre`. Call it holding the lock.
+
+        `seed` gives each value its own phase, so they do not all move as one
+        and the screen looks like a vessel rather than a metronome.
+        """
+        if (not self.wiggle) or (self.gain <= 0.0) or (not swing):
+            return centre
+        phase = (self.elapsed / WIGGLE_PERIOD_S) * 2.0 * math.pi
+        phase += float(seed % 11) * 0.57
+        return centre + swing * self.gain * math.sin(phase)
+
     def advance(self, seconds):
         """Move every value one step. Bounded, so a demonstration is safe."""
         with self.lock:
@@ -625,19 +666,10 @@ class TelemetryState:
             self.elapsed += seconds
             for tid, _src, field, centre, swing, _rate, _lab in TELEMETRY_TABLE:
                 key = (tid, field)
-                if key == (0x5000, 'fuel_level'):
-                    # Fuel drifts DOWN and stops at a floor, as a tank does.
-                    self.values[key] = max(
-                        FUEL_WIGGLE_FLOOR,
-                        self.values[key]
-                        - FUEL_DRIFT_PERCENT_PER_SECOND * seconds)
-                    continue
                 if swing is None:
-                    continue    # a value that does not move, such as hours
-                # A sine is bounded by construction, so it cannot wander.
-                phase = (self.elapsed / VOLTS_PERIOD_S) * 2.0 * math.pi
-                phase += float(tid % 7) * 0.9      # so they do not move as one
-                self.values[key] = centre + swing * math.sin(phase)
+                    # A value that must not move, such as an hour meter.
+                    continue
+                self.values[key] = self.wiggled(centre, swing, tid)
 
     def snapshot(self):
         with self.lock:
@@ -650,13 +682,7 @@ class TelemetryState:
         out = []
         for source_id, label, centre, swing in VOLTAGE_SOURCES:
             with self.lock:
-                elapsed = self.elapsed
-                wiggle = self.wiggle
-            volts = centre
-            if wiggle and swing:
-                phase = (elapsed / VOLTS_PERIOD_S) * 2.0 * math.pi
-                phase += float(source_id) * 1.3
-                volts = centre + swing * math.sin(phase)
+                volts = self.wiggled(centre, swing, source_id * 3)
             millivolts = int(round(volts * 1000.0))
             data = encode_raw(TID_VOLTAGE,
                               voltage_source_id=source_id,
@@ -1008,7 +1034,10 @@ HELP_TEXT = "\n".join([
     "  fuel <percent>    set the fuel level, 0 to 100. Example: fuel 42",
     "  volts <v>         set the alternator potential, %.1f to %.1f"
     % (VOLTS_MIN, VOLTS_MAX),
-    "  wiggle on|off     drift the telemetry, or hold it steady",
+    "  wiggle on|off     move the telemetry, or hold every value steady",
+    "  wiggle hold       the same as off. Hold a value while you explain it",
+    "  wiggle <gain>     0 to %.0f. Turn the movement up or down"
+    % WIGGLE_GAIN_MAX,
     "  telemetry         print what is on the wire and at what period",
     "  show              print the state and the next transmit frame",
     "  help              print this text",
@@ -1057,8 +1086,10 @@ def show_telemetry(telemetry):
     _fuel, _volts, wiggle = telemetry.snapshot()
     lines = ["-" * 66,
              "Vessel telemetry. These frames are what the VESSEL sends.",
-             "  wiggle : %s" % ("on, values drift" if wiggle
-                                else "off, values held steady"),
+             "  wiggle : %s" % (
+                 ("on, gain %.2f, %.0f s cycle"
+                  % (telemetry.gain, WIGGLE_PERIOD_S)) if wiggle
+                 else "HELD STEADY"),
              "  %-9s %-6s %-34s %10s  %s"
              % ("can_id", "rate", "value", "raw", "bytes")]
     for can_id, data, value, label, tid, _src in telemetry.frames():
@@ -1138,11 +1169,30 @@ def handle_command(state, stop_event, line):
         return
 
     if head == "wiggle":
-        if len(parts) < 2 or parts[1].lower() not in ("on", "off"):
-            say("Use: wiggle on, or wiggle off.")
+        if len(parts) < 2:
+            say("Use: wiggle on, wiggle off, or wiggle <gain> 0 to %.0f."
+                % WIGGLE_GAIN_MAX)
             return
-        on = TELEMETRY.set_wiggle(parts[1].lower() == "on")
-        say("Telemetry wiggle is %s." % ("on" if on else "off (held steady)"))
+        word = parts[1].lower()
+        if word == "on":
+            TELEMETRY.set_gain(WIGGLE_GAIN_DEFAULT)
+            say("Telemetry wiggle on at gain %.1f." % WIGGLE_GAIN_DEFAULT)
+        elif word in ("off", "hold"):
+            TELEMETRY.set_gain(0.0)
+            say("Telemetry HELD STEADY. Every value stops where it is.")
+        else:
+            try:
+                gain = float(word)
+            except ValueError:
+                say("wiggle needs on, off, hold, or a number. Got %s."
+                    % parts[1])
+                return
+            got = TELEMETRY.set_gain(gain)
+            if got <= 0.0:
+                say("Gain 0. Every value is held steady.")
+            else:
+                say("Telemetry wiggle gain %.2f. A full cycle is %.0f s."
+                    % (got, WIGGLE_PERIOD_S))
         show_telemetry(TELEMETRY)
         return
 
