@@ -728,6 +728,21 @@ class SimState:
                 self.event_echo = 0
                 self.accepted.clear()
                 self.last_accepted = None
+                # A SUCCESSFUL HANDSHAKE STARTS A NEW SESSION.
+                #
+                # This rig used to clear the event echo and KEEP the step
+                # table. So a display that power-cycled handshaked again and
+                # inherited the previous session: steps still GOOD, the veto
+                # still clear, and the display pulsing MISSION READY green on
+                # a boot where nothing had been checked. Only restarting this
+                # process cleared it, which is exactly the symptom Scott saw.
+                #
+                # A handshake is the two ends agreeing on a checklist BEFORE
+                # it runs. There is nothing to inherit.
+                self.states = [PENDING] * SPECTER_STEP_CAPACITY
+                self.operator_input_requested = False
+                self.hatch_port = HATCH_STOPPED
+                self.hatch_stbd = HATCH_STOPPED
             self.handshakes_answered += 1
             session_id = self.session_id
             checklist_id = self.checklist_version
