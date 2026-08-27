@@ -13,7 +13,7 @@ little-endian. They no longer share one layout. Each id has its own:
     byte 0 liveness_counter   byte 1 event_sequence
     byte 2 event_type         byte 3 step_index
     byte 4 display_state      byte 5 event_param
-    bytes 6 to 7 reserved
+    bytes 6 to 7 BUILD IDENTITY: flags, and the low commit byte
 
     can_id 0x240320  handshake request   the Screen asks    1000 ms
     byte 0 protocol   bytes 1 to 2 firmware identity
@@ -189,6 +189,14 @@ BUILD_BEHIND = 0x02
 BUILD_ID_UNKNOWN = 0x04
 BUILD_REMOTE_STALE = 0x08
 
+#: Bit 7. THIS IMAGE CARRIES AN IDENTITY AT ALL.
+#:
+#: WITHOUT IT, ZERO IS AMBIGUOUS. An image built before the identity existed
+#: sends 0x00 because these bytes were reserved, and 0x00 also means "clean
+#: and current". The bench read a four-day-old image as CLEAN, which is the
+#: exact false reassurance this mechanism exists to prevent.
+BUILD_PRESENT = 0x80
+
 _BUILD_FLAGS = (
     (BUILD_DIRTY, "DIRTY"),
     (BUILD_BEHIND, "BEHIND"),
@@ -198,8 +206,30 @@ _BUILD_FLAGS = (
 
 
 def build_flag_names(flags):
-    """Name every build flag set. An empty list means the image is clean."""
+    """Name every build flag set. Empty means the image is clean AND current.
+
+    An image with no presence bit predates the identity, so it can say
+    nothing about itself. That is reported as NO IDENTITY, never as clean.
+    """
+    if not flags & BUILD_PRESENT:
+        return ["NO IDENTITY: THIS IMAGE PREDATES THE BUILD STAMP"]
     return [name for bit, name in _BUILD_FLAGS if flags & bit]
+
+
+def build_identity_short(commit_low, flags):
+    """The build line for the DISPLAY FRAME, which carries one commit byte.
+
+    The commit reads `..ef`. THE DOTS ARE DELIBERATE: they say the rest is
+    not on this frame, rather than padding it with zeros that would read as
+    a real commit.
+    """
+    commit = "..%02x" % commit_low
+    if (flags & BUILD_ID_UNKNOWN) or not (flags & BUILD_PRESENT):
+        commit = "unknown"
+    names = build_flag_names(flags)
+    if not names:
+        return "commit %s CLEAN" % commit
+    return "commit %s *** %s ***" % (commit, ", ".join(names))
 
 
 def build_identity_text(major, minor, flags):
@@ -209,7 +239,7 @@ def build_identity_text(major, minor, flags):
     explains all of them at once, and chasing them one at a time does not.
     """
     commit = "%02x%02x" % (major, minor)
-    if flags & BUILD_ID_UNKNOWN:
+    if (flags & BUILD_ID_UNKNOWN) or not (flags & BUILD_PRESENT):
         commit = "unknown"
     names = build_flag_names(flags)
     if not names:
@@ -236,7 +266,7 @@ def decode_hs_request(data):
         # BYTE 4 IS THE BUILD FLAGS. It was reserved and always sent 0.
         "build_flags": flags,
         "build_text": build_identity_text(data[1], data[2], flags),
-        "build_clean": flags == 0,
+        "build_clean": flags == BUILD_PRESENT,
         # LinkState reads these on every frame. The handshake pair
         # carries no counter and no step states.
         "sequence": None,
@@ -327,6 +357,14 @@ def decode_display(data):
         "event_type": data[2],
         "step_index": data[3],
         "display_state": data[4],
+        # BYTES 6 AND 7 ARE THE BUILD IDENTITY. The handshake request carries
+        # it too, but that goes out only WHILE THE DISPLAY IS BLOCKED. A unit
+        # sat blocked for days and sent none, so nothing on the bus said
+        # which image it ran. THIS frame goes out in every state.
+        "build_flags": data[6],
+        "build_commit_low": data[7],
+        "build_text": build_identity_short(data[7], data[6]),
+        "build_clean": data[6] == BUILD_PRESENT,
         # BYTE 5 IS THE EVENT PARAMETER. It names which payload hatch an
         # actuate event drives: 0 both, 1 port, 2 starboard. Every other
         # event leaves it 0.

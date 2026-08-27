@@ -167,6 +167,62 @@ class TestDecode(unittest.TestCase):
                          ("S", "P", "E1", "C", "T", "E2", "R"))
 
 
+class TestTheIdentityOnEveryDisplayFrame(unittest.TestCase):
+    """Bytes 6 and 7 of the DISPLAY frame carry the build identity.
+
+    The handshake request carries it too, but that request goes out only
+    WHILE THE DISPLAY IS BLOCKED. A unit sat blocked on the bench for days
+    and sent none, so nothing on the bus could name the image it ran, and
+    the detector built for exactly that was blind to it. The display frame
+    goes out every 500 ms in every state.
+    """
+
+    @staticmethod
+    def df(flags=SL.BUILD_PRESENT, low=0):
+        return bytes([0x2A, 0, 0, 0xFF, 0, 0, flags, low])
+
+    def test_the_identity_is_decoded(self):
+        f = SL.decode_display(self.df(0x83, 0xEF))
+        self.assertEqual(f["build_flags"], 0x83)
+        self.assertEqual(f["build_commit_low"], 0xEF)
+        self.assertFalse(f["build_clean"])
+
+    def test_a_clean_image_reads_clean(self):
+        f = SL.decode_display(self.df(SL.BUILD_PRESENT, 0xEF))
+        self.assertTrue(f["build_clean"])
+        self.assertIn("CLEAN", f["build_text"])
+
+    def test_the_commit_is_never_padded_with_zeros(self):
+        """`..ef` says the rest is not on this frame. `00ef` would be a lie."""
+        f = SL.decode_display(self.df(SL.BUILD_PRESENT, 0xEF))
+        self.assertIn("..ef", f["build_text"])
+        self.assertNotIn("00ef", f["build_text"])
+
+    def test_an_unknown_identity_shows_no_commit(self):
+        f = SL.decode_display(self.df(SL.BUILD_ID_UNKNOWN | SL.BUILD_PRESENT, 0))
+        self.assertIn("unknown", f["build_text"])
+        self.assertNotIn("..", f["build_text"])
+
+    def test_zero_can_never_read_as_clean(self):
+        """THE FALSE REASSURANCE THIS PREVENTS.
+
+        An image built before the identity sends 0x00, and without a
+        presence bit 0x00 also means clean. The bench read a four-day-old
+        image as CLEAN because of exactly that, and every symptom on the
+        display was then chased as if the image were current.
+        """
+        f = SL.decode_display(self.df(0x00, 0x00))
+        self.assertFalse(f["build_clean"])
+        self.assertIn("NO IDENTITY", f["build_text"])
+        self.assertNotIn("CLEAN", f["build_text"])
+
+    def test_the_other_display_fields_still_decode(self):
+        f = SL.decode_display(self.df(0x81, 0xAB))
+        self.assertEqual(f["liveness_counter"], 0x2A)
+        self.assertEqual(f["step_index"], 0xFF)
+        self.assertEqual(f["display_state"], 0)
+
+
 class TestTheBuildFlags(unittest.TestCase):
     """Byte 4 of the handshake request names the image on the unit.
 
@@ -176,39 +232,40 @@ class TestTheBuildFlags(unittest.TestCase):
     """
 
     @staticmethod
-    def hs(flags=0, major=0x0C, minor=0xEF):
+    def hs(flags=SL.BUILD_PRESENT, major=0x0C, minor=0xEF):
         return bytes([1, major, minor, 24, flags, 0, 0, 0])
 
     def test_a_clean_image_reads_clean(self):
-        f = SL.decode_hs_request(self.hs(0))
+        f = SL.decode_hs_request(self.hs(SL.BUILD_PRESENT))
         self.assertTrue(f["build_clean"])
         self.assertIn("CLEAN", f["build_text"])
         self.assertIn("0cef", f["build_text"])
 
     def test_a_dirty_image_shouts(self):
-        f = SL.decode_hs_request(self.hs(SL.BUILD_DIRTY))
+        f = SL.decode_hs_request(self.hs(SL.BUILD_DIRTY | SL.BUILD_PRESENT))
         self.assertFalse(f["build_clean"])
         self.assertIn("DIRTY", f["build_text"])
         self.assertIn("***", f["build_text"])
 
     def test_dirty_and_behind_are_both_named(self):
-        f = SL.decode_hs_request(self.hs(SL.BUILD_DIRTY | SL.BUILD_BEHIND))
+        f = SL.decode_hs_request(self.hs(SL.BUILD_DIRTY | SL.BUILD_BEHIND | SL.BUILD_PRESENT))
         self.assertIn("DIRTY", f["build_text"])
         self.assertIn("BEHIND", f["build_text"])
 
     def test_an_unknown_identity_never_shows_a_plausible_commit(self):
-        f = SL.decode_hs_request(self.hs(SL.BUILD_ID_UNKNOWN, 0, 0))
+        f = SL.decode_hs_request(self.hs(SL.BUILD_ID_UNKNOWN | SL.BUILD_PRESENT, 0, 0))
         self.assertIn("unknown", f["build_text"])
         self.assertNotIn("0000", f["build_text"])
 
     def test_the_flag_values(self):
+        self.assertEqual(SL.BUILD_PRESENT, 0x80)
         self.assertEqual(SL.BUILD_DIRTY, 0x01)
         self.assertEqual(SL.BUILD_BEHIND, 0x02)
         self.assertEqual(SL.BUILD_ID_UNKNOWN, 0x04)
         self.assertEqual(SL.BUILD_REMOTE_STALE, 0x08)
 
     def test_the_other_request_fields_still_decode(self):
-        f = SL.decode_hs_request(self.hs(0x03))
+        f = SL.decode_hs_request(self.hs(0x83))
         self.assertEqual(f["protocol_version"], 1)
         self.assertEqual(f["step_capacity"], 24)
         self.assertEqual(f["firmware_text"], "0x0CEF")

@@ -287,6 +287,17 @@ class SpecterScreen(Screen):
                 "value": f.get("build_text", "unknown"),
                 "state": None if f.get("build_clean") else "fault",
             })
+        elif df and df.get("fields"):
+            # NO HANDSHAKE REQUEST IS COMING. A blocked or stuck image sends
+            # none at all, which is exactly the case the identity exists to
+            # catch. The display frame carries it in every state, so read it
+            # from there instead of showing nothing.
+            f = df["fields"]
+            rows.append({
+                "label": "BUILD",
+                "value": f.get("build_text", "unknown"),
+                "state": None if f.get("build_clean") else "fault",
+            })
         if hs_rsp and hs_rsp.get("fields"):
             f = hs_rsp["fields"]
             rows.append({
