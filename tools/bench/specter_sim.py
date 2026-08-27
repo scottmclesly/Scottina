@@ -399,7 +399,13 @@ class SimState:
         self.event_echo = 0
         self.operator_input_requested = False
         self.vessel_mode = int(SpecterVesselMode.CREWED)
+        # Every sequence ever seen. It is a COUNTER for the panel, never a
+        # dedup: see on_display_frame for why that was wrong.
         self.accepted = set()
+        # The one sequence the dedup tests against.
+        self.last_accepted = None
+        # The automatic hatch cycle, when one is running.
+        self.hatch_cycle = None
         self.events_run = 0
         self.handshakes_answered = 0
         # What the DISPLAY last told each hatch to do. Not where it is.
@@ -506,8 +512,21 @@ class SimState:
                 self.event_echo = 0
             return None
         with self.lock:
-            if sequence in self.accepted:
+            # DEDUP ON THE LAST ACCEPTED SEQUENCE, NOT ON EVERY SEQUENCE EVER.
+            #
+            # The display holds ONE outstanding event at a time and repeats
+            # its frame until this rig echoes it, so a repeat is always the
+            # sequence that came immediately before. Remembering just that one
+            # is enough to run each action exactly once.
+            #
+            # An unbounded set was WRONG, and the wrongness was hidden. The
+            # sequence field is four bits and cycles 1 to 15, so a set that
+            # never forgets ignores EVERYTHING once fifteen actions have run.
+            # A display bug used to send every event as sequence 1, which kept
+            # the set at one entry and hid this for the whole life of the rig.
+            if sequence == self.last_accepted:
                 return None
+            self.last_accepted = sequence
             self.accepted.add(sequence)
             self.events_run += 1
         self._run_event(fields)
@@ -530,6 +549,8 @@ class SimState:
             self.set_step(step, ACTIVE)
             with self.lock:
                 self.operator_input_requested = False
+            if step == HATCH_STEP:
+                self.start_hatch_cycle()
         elif event == int(SpecterEventType.STEP_CONFIRM) and step != 0xFF:
             # A step becomes GOOD only on operator confirmation.
             self.set_step(step, GOOD)
@@ -556,6 +577,10 @@ class SimState:
         motion = ACTUATE_EVENTS[event]
         target = fields.get("event_param", 0)
         step = fields["step_index"]
+        # A manual command from the operator OUTRANKS the automatic cycle. The
+        # thread keeps its own schedule, so this only records the operator's
+        # intent; the bench sees the last command win, which is what the
+        # operator expects when they take hold of the pad.
 
         if step != HATCH_STEP:
             say("REFUSED: %s is for step %d, the payload hatch. It arrived "
@@ -578,6 +603,66 @@ class SimState:
         say("HATCH %s %s -> port %s, starboard %s"
             % (event_name(event), target_name(target),
                HATCH_MOTION_NAMES[port], HATCH_MOTION_NAMES[stbd]))
+
+    #: The automatic hatch cycle, in seconds. Both hatches open, hold, then
+    #: close. It is the NODE'S work: the display sends STEP_BEGIN and watches.
+    HATCH_OPEN_S = 4.0
+    HATCH_HOLD_S = 2.0
+    HATCH_CLOSE_S = 4.0
+
+    def start_hatch_cycle(self):
+        """Open both hatches, hold, then close them. STEP_BEGIN starts it.
+
+        THE DISPLAY DOES NOT DRIVE THIS. It sends STEP_BEGIN like every other
+        step and the node cycles the actuators. The operator then has the
+        d-pad for manual control, which is what the rest of that screen is
+        for.
+
+        The step is left ACTIVE at the end, not GOOD. A step becomes GOOD only
+        when the operator confirms it.
+        """
+        with self.lock:
+            running = self.hatch_cycle is not None and self.hatch_cycle.is_alive()
+        if running:
+            say("The automatic hatch cycle is already running.")
+            return
+
+        def run():
+            total = self.HATCH_OPEN_S + self.HATCH_HOLD_S + self.HATCH_CLOSE_S
+            say("AUTOMATIC HATCH CYCLE: both hatches open, hold, close. "
+                "%.0f s in total." % total)
+            with self.lock:
+                self.hatch_port = HATCH_OPENING
+                self.hatch_stbd = HATCH_OPENING
+            say("  opening both. %s" % self.hatch_text())
+            time.sleep(self.HATCH_OPEN_S)
+
+            with self.lock:
+                self.hatch_port = HATCH_STOPPED
+                self.hatch_stbd = HATCH_STOPPED
+            say("  both open, holding. %s" % self.hatch_text())
+            time.sleep(self.HATCH_HOLD_S)
+
+            with self.lock:
+                self.hatch_port = HATCH_CLOSING
+                self.hatch_stbd = HATCH_CLOSING
+            say("  closing both. %s" % self.hatch_text())
+            time.sleep(self.HATCH_CLOSE_S)
+
+            with self.lock:
+                self.hatch_port = HATCH_STOPPED
+                self.hatch_stbd = HATCH_STOPPED
+                # The node has finished its part and now waits for the
+                # operator. The step stays ACTIVE: only the operator makes it
+                # GOOD, and the d-pad stays live for manual control.
+                self.operator_input_requested = True
+            say("  cycle complete. The step stays ACTIVE and the d-pad is "
+                "live. %s" % self.hatch_text())
+
+        thread = threading.Thread(target=run, name="hatch-cycle", daemon=True)
+        with self.lock:
+            self.hatch_cycle = thread
+        thread.start()
 
     def hatch_text(self):
         """One line saying what the display last told the hatches to do."""
@@ -642,6 +727,7 @@ class SimState:
             if result == int(SpecterHandshakeResult.ACCEPT):
                 self.event_echo = 0
                 self.accepted.clear()
+                self.last_accepted = None
             self.handshakes_answered += 1
             session_id = self.session_id
             checklist_id = self.checklist_version
