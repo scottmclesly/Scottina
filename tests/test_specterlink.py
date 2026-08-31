@@ -721,9 +721,13 @@ class TestTheDrawnScreenNamesTheImage(unittest.TestCase):
     """The unit in front of you was the one place that never said which
     image it was running."""
 
-    def _lines(self, display_data, hs_req=None):
+    #: The node control is bottom-anchored and opaque on the 320x480 panel,
+    #: so this is how much glass the text block actually gets: five lines.
+    FLOOR = 5 * 12
+
+    def _lines(self, display_data, hs_req=None, hs_rsp=None, floor=None):
         import types
-        screen = panel(display_data, hs_req=hs_req)
+        screen = panel(display_data, hs_req=hs_req, hs_rsp=hs_rsp)
         screen.app = types.SimpleNamespace(w=320)
         drawn = []
 
@@ -734,7 +738,8 @@ class TestTheDrawnScreenNamesTheImage(unittest.TestCase):
         class Palette:
             fg = muted = warn = ok = bad = (0, 0, 0)
 
-        screen._specter_lines(Draw(), Palette(), 0)
+        screen._specter_lines(Draw(), Palette(), 0,
+                              floor=self.FLOOR if floor is None else floor)
         return drawn
 
     def test_the_build_line_is_drawn_from_the_display_frame(self):
@@ -744,15 +749,30 @@ class TestTheDrawnScreenNamesTheImage(unittest.TestCase):
         self.assertEqual(len(build), 1)
         self.assertIn("DIRTY", build[0])
 
-    def test_the_build_line_stays_visible_on_a_320x480_panel(self):
-        """It sits above the NODE control, and the control is opaque.
+    def test_nothing_is_ever_drawn_under_the_node_control(self):
+        """The control is opaque and bottom-anchored, so a line written
+        under it is a line the operator cannot read."""
+        lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                            hs_rsp=hs_response_frame())
+        self.assertLessEqual(len(lines) * 12, self.FLOOR)
 
-        An added line pushed BUILD underneath the button, where the operator
-        could not read it. The line budget is what keeps it on the glass.
+    def test_build_survives_when_the_block_is_full(self):
+        """A handshake row plus a build row is one line more than fits.
+
+        BUILD is the line that must survive: a dirty image explains every
+        other symptom at once. SHORE is the one that goes -- slot 13 is not
+        a checklist step, and it is still on the web mirror.
         """
-        lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD))
-        self.assertLessEqual(len(lines), 5,
-                             "the drawn block has room for five lines")
+        lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                            hs_rsp=hs_response_frame())
+        self.assertTrue(any(line.startswith("BUILD") for line in lines))
+        self.assertTrue(any(line.startswith("HSHAKE") for line in lines))
+        self.assertFalse(any(line.startswith("SHORE") for line in lines))
+
+    def test_shore_comes_back_when_there_is_room(self):
+        lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                            hs_rsp=hs_response_frame(), floor=1000)
+        self.assertTrue(any(line.startswith("SHORE") for line in lines))
 
     def test_the_handshake_request_still_wins_on_the_screen(self):
         lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD),

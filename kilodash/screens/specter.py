@@ -483,8 +483,20 @@ class SpecterScreen(Screen):
             d.text((x0 + cw / 2 - lw_ / 2, y + 6), label, font=f, fill=tc)
         return y + h
 
-    def _specter_lines(self, d, th, y):
-        """The lines that say what the checklist is doing, in words."""
+    def _specter_lines(self, d, th, y, floor=None):
+        """The lines that say what the checklist is doing, in words.
+
+        `floor` is the first y this block must not draw at or past — the top
+        of the node control. THE PANEL IS GENUINELY FULL at 320x480, and the
+        control is opaque and bottom-anchored, so a line written under it is
+        a line the operator cannot read. Anything that does not fit is
+        dropped here rather than drawn where nobody can see it.
+
+        The order below is therefore a PRIORITY ORDER, not a layout: the
+        least useful line has to be the one that goes. SHORE is last because
+        slot 13 is not a checklist step, and every line is on the web mirror
+        regardless, where there is no such limit.
+        """
         w = self.app.w
         disp, node = self._snap
         df = disp.get("fields") or {}
@@ -494,8 +506,11 @@ class SpecterScreen(Screen):
 
         def line(text, colour):
             nonlocal y
+            if floor is not None and y + 12 > floor:
+                return False
             d.text((14, y), text[:62], font=f, fill=colour)
             y += 12
+            return True
 
         if df:
             line("STATE  %s" % SL.display_state_name(df.get("display_state", 0)),
@@ -509,11 +524,6 @@ class SpecterScreen(Screen):
             line("VETO   %s   %d of %d steps GOOD"
                  % ("SET" if veto else "CLEAR", good, SL.STEPS_IN_USE),
                  th.warn if veto else th.ok)
-            shore = nf.get("shore_link")
-            if shore is not None:
-                line("SHORE  slot 13 %s   (not a checklist step)"
-                     % SL.STATE_NAMES[shore],
-                     th.ok if shore == SL.GOOD else th.muted)
 
         seq = df.get("event_sequence", 0) if df else 0
         if seq:
@@ -543,6 +553,15 @@ class SpecterScreen(Screen):
             # display frame carries the identity in every state; read it.
             line("BUILD  %s" % df.get("build_text", "unknown"),
                  th.fg if df.get("build_clean") else th.bad)
+
+        # LAST, because slot 13 is not a checklist step. It is the line the
+        # panel can most afford to lose when the block runs out of glass.
+        if nf:
+            shore = nf.get("shore_link")
+            if shore is not None:
+                line("SHORE  slot 13 %s   (not a checklist step)"
+                     % SL.STATE_NAMES[shore],
+                     th.ok if shore == SL.GOOD else th.muted)
         return y
 
     def _section(self, d, th, y, snap, who):
@@ -578,7 +597,7 @@ class SpecterScreen(Screen):
         # ---- the SPECTER state: the strip, then the words ----
         y = self._steps_strip(d, th, y)
         y += 4
-        y = self._specter_lines(d, th, y)
+        y = self._specter_lines(d, th, y, floor=h - BTN_H - 16)
         y += 4
 
         # ---- bus card ----
