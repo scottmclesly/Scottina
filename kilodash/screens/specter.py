@@ -384,17 +384,14 @@ class SpecterScreen(Screen):
         sub = self._period_text(snap) if alive else self._stale_text(snap)
         d.text((68, y + 33), sub, font=T.font(T.SUB, mono=True), fill=th.muted)
 
+        # THE HEARTBEAT AND THE ID, AND NOTHING ELSE. Frame totals, gaps and
+        # repeats moved off the glass to the web mirror: they are a forensic
+        # record, and this banner answers a live question -- is this end
+        # talking, and how fast. Counting is not what the operator reads here.
         f2 = T.font(10, bold=True, mono=True)
         tag = "0x%06X" % snap["can_id"]
         tw = d.textlength(tag, font=f2)
-        d.text((w - 24 - tw, y + 10), tag, font=f2, fill=th.muted)
-        cnt = "n %d" % snap["frames"]
-        tw = d.textlength(cnt, font=f2)
-        d.text((w - 24 - tw, y + 24), cnt, font=f2, fill=th.fg)
-        if snap["gaps"] or snap["repeats"]:
-            warn = "gap %d rpt %d" % (snap["gaps"], snap["repeats"])
-            tw = d.textlength(warn, font=f2)
-            d.text((w - 24 - tw, y + 38), warn, font=f2, fill=th.warn)
+        d.text((w - 24 - tw, y + 21), tag, font=f2, fill=th.muted)
         return y + 52
 
     @staticmethod
@@ -411,40 +408,6 @@ class SpecterScreen(Screen):
                         fill=c)
             d.rectangle((cx - lw / 2, cy + r * 0.3, cx + lw / 2, cy + r * 0.55),
                         fill=c)
-
-    def _groups(self, d, th, y, snap):
-        """The seven-cell group strip: colour = state, letter = identity."""
-        w = self.app.w
-        states = snap["states"]
-        n = len(SL.GROUP_LETTERS)
-        gap = 4
-        cw = (w - 28 - gap * (n - 1)) / n
-        h = 40
-        for i, letter in enumerate(SL.GROUP_LETTERS):
-            x0 = 14 + i * (cw + gap)
-            box = (x0, y, x0 + cw, y + h)
-            value = states[i] if states else None
-            if value is None:
-                d.rectangle(box, outline=th.card_hi, width=1)
-                d.text((x0 + cw / 2 - 3, y + 12), "-",
-                       font=T.font(13, bold=True, mono=True), fill=th.muted)
-                continue
-            col = self._state_colour(th, value)
-            if value == SL.PENDING:
-                # hollow = not reached yet (extinguished, not absent)
-                d.rectangle(box, outline=col, width=1)
-                lc, sc = th.muted, th.muted
-            else:
-                d.rectangle(box, fill=col)
-                lc, sc = th.ink, th.ink
-            lf = T.font(15, bold=True, mono=True)
-            lw_ = d.textlength(letter, font=lf)
-            d.text((x0 + cw / 2 - lw_ / 2, y + 5), letter, font=lf, fill=lc)
-            sf = T.font(10, bold=True, mono=True)
-            si = SL.STATE_INITIALS[value]
-            sw = d.textlength(si, font=sf)
-            d.text((x0 + cw / 2 - sw / 2, y + 24), si, font=sf, fill=sc)
-        return y + h
 
     def _steps_strip(self, d, th, y):
         """All 13 steps as one strip: colour is state, number is the step.
@@ -483,6 +446,39 @@ class SpecterScreen(Screen):
             d.text((x0 + cw / 2 - lw_ / 2, y + 6), label, font=f, fill=tc)
         return y + h
 
+    def _veto(self, d, th, y):
+        """THE VETO, as an indicator instead of a sentence.
+
+        It is the one thing on this screen that gates the boat, and it was a
+        line of small text among four other lines of small text. Same idiom
+        as the heartbeat banner above it: an accent bar carries the state in
+        colour, so it reads from arm's length without being read.
+        """
+        w = self.app.w
+        _disp, node = self._snap
+        nf = node.get("fields") or {}
+        if not nf:
+            return y
+        veto = bool(nf.get("veto"))
+        good = sum(1 for value in nf.get("steps", []) if value == SL.GOOD)
+        col = th.warn if veto else th.ok
+        h = 34
+        d.rectangle((14, y, w - 14, y + h), fill=th.card,
+                    outline=th.card_hi, width=1)
+        # Fail-closed reads as caution, not as fault: a held veto is the
+        # system working, not the system broken.
+        d.rectangle((14, y, 18, y + h), fill=col)
+        d.text((30, y + 5), spaced("VETO"),
+               font=T.font(10, bold=True, mono=True), fill=th.muted)
+        d.text((30, y + 17), "SET" if veto else "CLEAR",
+               font=T.font(14, bold=True, mono=True), fill=col)
+        tail = ("%d of %d steps GOOD" % (good, SL.STEPS_IN_USE) if veto
+                else "checklist complete")
+        f2 = T.font(T.SUB, mono=True)
+        tw = d.textlength(tail, font=f2)
+        d.text((w - 24 - tw, y + 18), tail, font=f2, fill=th.fg)
+        return y + h
+
     def _specter_lines(self, d, th, y, floor=None):
         """The lines that say what the checklist is doing, in words.
 
@@ -518,13 +514,6 @@ class SpecterScreen(Screen):
         else:
             line("STATE  no display frame", th.muted)
 
-        if nf:
-            good = sum(1 for s in nf.get("steps", []) if s == SL.GOOD)
-            veto = bool(nf.get("veto"))
-            line("VETO   %s   %d of %d steps GOOD"
-                 % ("SET" if veto else "CLEAR", good, SL.STEPS_IN_USE),
-                 th.warn if veto else th.ok)
-
         seq = df.get("event_sequence", 0) if df else 0
         if seq:
             echo = nf.get("event_echo") if nf else None
@@ -553,15 +542,6 @@ class SpecterScreen(Screen):
             # display frame carries the identity in every state; read it.
             line("BUILD  %s" % df.get("build_text", "unknown"),
                  th.fg if df.get("build_clean") else th.bad)
-
-        # LAST, because slot 13 is not a checklist step. It is the line the
-        # panel can most afford to lose when the block runs out of glass.
-        if nf:
-            shore = nf.get("shore_link")
-            if shore is not None:
-                line("SHORE  slot 13 %s   (not a checklist step)"
-                     % SL.STATE_NAMES[shore],
-                     th.ok if shore == SL.GOOD else th.muted)
         return y
 
     def _section(self, d, th, y, snap, who):
@@ -573,14 +553,13 @@ class SpecterScreen(Screen):
         d.text((w - 14 - tw, y + 1), who, font=f, fill=th.muted)
         y += 14
         y = self._banner(d, th, y, snap)
-        y += 6
-        y = self._groups(d, th, y, snap)
-        raw = snap["data"]
-        if raw:
-            hexes = " ".join("%02X" % b for b in raw)
-            d.text((14, y + 4), hexes, font=T.font(10, mono=True),
-                   fill=th.muted)
-        return y + 18
+        # The seven-group strip used to be drawn here for BOTH ends. Only the
+        # status frame carries step states, so on the display side it was
+        # seven empty boxes of dashes -- forty pixels saying nothing, on a
+        # panel that had the bus card hidden under the button for want of
+        # them. The rollup is still on the web mirror, where it costs nothing.
+        # The raw eight bytes went the same way.
+        return y + 8
 
     def draw_content(self, d, th):
         w, h = self.app.w, self.app.h
@@ -596,7 +575,9 @@ class SpecterScreen(Screen):
 
         # ---- the SPECTER state: the strip, then the words ----
         y = self._steps_strip(d, th, y)
-        y += 4
+        y += 6
+        y = self._veto(d, th, y)
+        y += 6
         y = self._specter_lines(d, th, y, floor=h - BTN_H - 16)
         y += 4
 

@@ -769,10 +769,24 @@ class TestTheDrawnScreenNamesTheImage(unittest.TestCase):
         self.assertTrue(any(line.startswith("HSHAKE") for line in lines))
         self.assertFalse(any(line.startswith("SHORE") for line in lines))
 
-    def test_shore_comes_back_when_there_is_room(self):
+    def test_slot_13_is_on_the_mirror_and_not_on_the_glass(self):
+        """The shore link is not a checklist step. It keeps its row on the
+        web mirror, where space is free, and gives up its line on the 320x480
+        panel, where the three things the operator watches -- the heartbeat,
+        the coloured step numbers and the veto -- come first."""
         lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD),
                             hs_rsp=hs_response_frame(), floor=1000)
-        self.assertTrue(any(line.startswith("SHORE") for line in lines))
+        self.assertFalse(any(line.startswith("SHORE") for line in lines))
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                     node_frame(shore=SL.GOOD)).specter_rows()
+        self.assertIsNotNone(row(rows, "13 shore operator link"))
+
+    def test_the_veto_left_the_words_for_its_own_indicator(self):
+        """It gates the boat. It is not a sentence among sentences."""
+        lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD))
+        self.assertFalse(any(line.startswith("VETO") for line in lines))
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD)).specter_rows()
+        self.assertIsNotNone(row(rows, "VETO"), "the mirror still carries it")
 
     def test_the_handshake_request_still_wins_on_the_screen(self):
         lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD),
