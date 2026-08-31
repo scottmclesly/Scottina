@@ -587,5 +587,220 @@ class TestNoTxSurface(unittest.TestCase):
                          "expected exactly one panel control on SPECTER")
 
 
+# --------------------------------------------------------------------------
+# The panel row builder. THIS LAYER HAD NO TEST, which is how a dead branch
+# survived: every field below decodes correctly and was covered, and the
+# screen still rendered none of it.
+# --------------------------------------------------------------------------
+def _load_screen_module():
+    """Import the SPECTER screen, standing in for PIL if it is absent.
+
+    The screen needs PIL for names at import time and for the font cache.
+    This file promises stdlib only, and the bench runs it on machines with
+    no Pillow, so supply a stub when the real one is missing. A machine that
+    HAS Pillow uses it, so this never hides a real import error there.
+    """
+    import types
+    if "PIL" not in sys.modules:
+        pil = types.ModuleType("PIL")
+
+        def _truetype(*args, **kwargs):
+            # theme.font() catches OSError and falls back, so this is the
+            # documented path, not an error the test is papering over.
+            raise OSError("no fonts in the test environment")
+
+        pil.ImageFont = types.SimpleNamespace(truetype=_truetype,
+                                              load_default=lambda: object())
+        pil.Image = types.SimpleNamespace()
+        pil.ImageDraw = types.SimpleNamespace()
+        sys.modules["PIL"] = pil
+        for name in ("ImageFont", "Image", "ImageDraw"):
+            sys.modules["PIL." + name] = getattr(pil, name)
+    from kilodash.screens import specter as screen_module
+    return screen_module
+
+
+def display_frame_build(flags, commit_low, state=0):
+    """A display frame carrying a build identity in bytes 6 and 7."""
+    data = bytearray(display_frame(state=state))
+    data[6] = flags
+    data[7] = commit_low
+    return bytes(data)
+
+
+def hs_request_frame(flags=SL.BUILD_PRESENT, major=0x0C, minor=0xEF):
+    return bytes([1, major, minor, SL.STEP_CAPACITY, flags, 0, 0, 0])
+
+
+def hs_response_frame(result=0, checklist=1, session=7, steps=13):
+    return bytes([1, result, checklist & 0xFF, checklist >> 8,
+                  session & 0xFF, session >> 8, steps, 0])
+
+
+def _snapshot(can_id, label, data, decoder):
+    """The shape LinkState.snapshot() returns, with the fields decoded."""
+    fields = decoder(data)
+    return {"can_id": can_id, "label": label, "alive": True, "age": 0.1,
+            "frames": 10, "gaps": 0, "repeats": 0, "period_ms": 500.0,
+            "period_avg_ms": 500.0, "period_min_ms": 500.0,
+            "period_max_ms": 500.0, "fields": fields, "data": data,
+            "states": (fields or {}).get("states")}
+
+
+def panel(display_data, node_data=None, hs_req=None, hs_rsp=None):
+    """A screen with no app and no socket, holding one pair of frames."""
+    module = _load_screen_module()
+    screen = object.__new__(module.SpecterScreen)
+    screen._snap = (
+        _snapshot(SL.DISPLAY_CAN_ID, "DISPLAY", display_data, SL.decode_display),
+        _snapshot(SL.NODE_CAN_ID, "NODE", node_data if node_data is not None
+                  else node_frame(), SL.decode_node))
+    screen._hs = ({"fields": SL.decode_hs_request(hs_req) if hs_req else None},
+                  {"fields": SL.decode_hs_response(hs_rsp) if hs_rsp else None})
+    screen._sim = "inactive"      # keep the telemetry block to one row
+    return screen
+
+
+def row(rows, label):
+    for entry in rows:
+        if entry["label"] == label:
+            return entry
+    return None
+
+
+class TestTheBuildLineReachesThePanel(unittest.TestCase):
+    """A blocked display sends no handshake request. It still has an image.
+
+    The fallback that reads the identity off the display frame was written
+    for exactly that case and never ran: it tested `df.get("fields")`, and
+    `df` is already the fields dict. The bench read a DIRTY image as though
+    nothing were wrong, which is the false reassurance the identity exists
+    to prevent.
+    """
+
+    def test_the_build_line_appears_with_no_handshake_at_all(self):
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD)).specter_rows()
+        self.assertIsNotNone(row(rows, "BUILD"),
+                             "a display that never handshakes still has a build")
+
+    def test_a_dirty_image_reads_as_a_fault(self):
+        rows = panel(display_frame_build(
+            SL.BUILD_PRESENT | SL.BUILD_DIRTY, 0xFD)).specter_rows()
+        build = row(rows, "BUILD")
+        self.assertIn("DIRTY", build["value"])
+        self.assertEqual(build["state"], "fault")
+
+    def test_a_clean_image_carries_no_fault(self):
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD)).specter_rows()
+        build = row(rows, "BUILD")
+        self.assertIn("CLEAN", build["value"])
+        self.assertIsNone(build["state"])
+
+    def test_an_image_with_no_identity_is_never_reported_clean(self):
+        rows = panel(display_frame_build(0, 0)).specter_rows()
+        build = row(rows, "BUILD")
+        self.assertIn("NO IDENTITY", build["value"])
+        self.assertEqual(build["state"], "fault")
+
+    def test_the_handshake_request_wins_when_one_arrived(self):
+        """It carries two commit bytes; the display frame carries one."""
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                     hs_req=hs_request_frame()).specter_rows()
+        build = row(rows, "BUILD")
+        self.assertIn("0cef", build["value"])
+        self.assertNotIn("..fd", build["value"])
+        self.assertIsNotNone(row(rows, "FIRMWARE"))
+
+    def test_exactly_one_build_row_is_produced(self):
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                     hs_req=hs_request_frame()).specter_rows()
+        self.assertEqual(sum(1 for r in rows if r["label"] == "BUILD"), 1)
+
+
+class TestTheHandshakeRowReportsSilence(unittest.TestCase):
+    """A row that exists only once a handshake lands cannot report the
+    failure it matters most for."""
+
+    def test_the_panel_says_when_it_has_seen_no_handshake(self):
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD)).specter_rows()
+        self.assertIsNotNone(row(rows, "HANDSHAKE"))
+
+    def test_silence_against_a_blocked_display_is_a_fault(self):
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD,
+                                         state=0)).specter_rows()
+        self.assertEqual(row(rows, "HANDSHAKE")["state"], "fault")
+        self.assertIn("BLOCKED", row(rows, "HANDSHAKE")["value"])
+
+    def test_silence_against_a_running_display_is_only_a_caution(self):
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD,
+                                         state=2)).specter_rows()
+        self.assertEqual(row(rows, "HANDSHAKE")["state"], "caution")
+
+    def test_it_never_claims_a_handshake_never_happened(self):
+        """The reader opens on entry to the tile and closes on leave, so it
+        can only speak for this visit."""
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD)).specter_rows()
+        value = row(rows, "HANDSHAKE")["value"]
+        self.assertIn("none seen", value)
+        self.assertNotIn("never", value)
+
+    def test_an_accepted_handshake_is_reported_as_before(self):
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                     hs_rsp=hs_response_frame(result=0, session=7)).specter_rows()
+        handshake = row(rows, "HANDSHAKE")
+        self.assertEqual(handshake["state"], "ok")
+        self.assertIn("ACCEPT", handshake["value"])
+        self.assertIn("session 7", handshake["value"])
+
+    def test_exactly_one_handshake_row_is_produced(self):
+        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                     hs_rsp=hs_response_frame()).specter_rows()
+        self.assertEqual(sum(1 for r in rows if r["label"] == "HANDSHAKE"), 1)
+
+
+class TestTheDrawnScreenNamesTheImage(unittest.TestCase):
+    """The unit in front of you was the one place that never said which
+    image it was running."""
+
+    def _lines(self, display_data, hs_req=None):
+        import types
+        screen = panel(display_data, hs_req=hs_req)
+        screen.app = types.SimpleNamespace(w=320)
+        drawn = []
+
+        class Draw:
+            def text(self, xy, text, font=None, fill=None):
+                drawn.append(text)
+
+        class Palette:
+            fg = muted = warn = ok = bad = (0, 0, 0)
+
+        screen._specter_lines(Draw(), Palette(), 0)
+        return drawn
+
+    def test_the_build_line_is_drawn_from_the_display_frame(self):
+        lines = self._lines(display_frame_build(
+            SL.BUILD_PRESENT | SL.BUILD_DIRTY, 0xFD))
+        build = [line for line in lines if line.startswith("BUILD")]
+        self.assertEqual(len(build), 1)
+        self.assertIn("DIRTY", build[0])
+
+    def test_the_screen_reports_handshake_silence_too(self):
+        """Both surfaces carry the same finding, so they cannot disagree."""
+        lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD))
+        shake = [line for line in lines if line.startswith("HSHAKE")]
+        self.assertEqual(len(shake), 1)
+        self.assertIn("none seen", shake[0])
+        self.assertIn("BLOCKED", shake[0])
+        self.assertLessEqual(len(shake[0]), 62, "the panel clips at 62")
+
+    def test_the_handshake_request_still_wins_on_the_screen(self):
+        lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD),
+                            hs_req=hs_request_frame())
+        build = [line for line in lines if line.startswith("BUILD")]
+        self.assertEqual(len(build), 1)
+        self.assertIn("0cef", build[0])
+
+
 if __name__ == "__main__":
     unittest.main()

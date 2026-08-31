@@ -287,16 +287,21 @@ class SpecterScreen(Screen):
                 "value": f.get("build_text", "unknown"),
                 "state": None if f.get("build_clean") else "fault",
             })
-        elif df and df.get("fields"):
+        elif df:
             # NO HANDSHAKE REQUEST IS COMING. A blocked or stuck image sends
             # none at all, which is exactly the case the identity exists to
             # catch. The display frame carries it in every state, so read it
             # from there instead of showing nothing.
-            f = df["fields"]
+            #
+            # `df` IS ALREADY THE FIELDS DICT. This read it as
+            # `df.get("fields")`, a key no decoder sets, so the fallback
+            # never ran and a blocked display showed NO BUILD LINE AT ALL --
+            # the one case it was written for. The bench then ran a DIRTY
+            # image for a day with nothing on the panel saying so.
             rows.append({
                 "label": "BUILD",
-                "value": f.get("build_text", "unknown"),
-                "state": None if f.get("build_clean") else "fault",
+                "value": df.get("build_text", "unknown"),
+                "state": None if df.get("build_clean") else "fault",
             })
         if hs_rsp and hs_rsp.get("fields"):
             f = hs_rsp["fields"]
@@ -306,6 +311,22 @@ class SpecterScreen(Screen):
                           % (f["result_text"], f["checklist_id"],
                              f["session_id"], f["step_count"])),
                 "state": "ok" if f["result"] == 0 else "fault",
+            })
+        elif df:
+            # SILENCE HERE IS THE FINDING, so print it rather than nothing.
+            # A row that only exists once a handshake lands cannot report
+            # the failure it matters most for.
+            #
+            # Say NOT SEEN, never "never happened": the reader is opened on
+            # entry to this tile and closed on leave, so a handshake the
+            # display sent once at power-on, before anyone opened the tile,
+            # leaves no trace here. Only the display frame is continuous.
+            rows.append({
+                "label": "HANDSHAKE",
+                "value": ("none seen while this tile has been open"
+                          + ("   and the display reports BLOCKED"
+                             if df.get("display_state") == 0 else "")),
+                "state": "fault" if df.get("display_state") == 0 else "caution",
             })
 
         # ---- what this rig is putting on the wire ----
@@ -528,10 +549,23 @@ class SpecterScreen(Screen):
             line("HSHAKE %s  checklist 0x%04X  session %d"
                  % (g["result_text"], g["checklist_id"], g["session_id"]),
                  th.ok if g["result"] == 0 else th.bad)
+        elif df:
+            # The same finding the web rows carry, so the two surfaces never
+            # disagree. Short enough for the 62-column clip on this panel.
+            blocked = df.get("display_state") == 0
+            line("HSHAKE none seen here%s"
+                 % ("   display says BLOCKED" if blocked else ""),
+                 th.bad if blocked else th.warn)
         if hs_req and hs_req.get("fields"):
             g = hs_req["fields"]
             line("BUILD  %s" % g.get("build_text", "unknown"),
                  th.fg if g.get("build_clean") else th.bad)
+        elif df:
+            # The drawn screen had no fallback at all, so the unit in front
+            # of you was the one place that never named its own image. The
+            # display frame carries the identity in every state; read it.
+            line("BUILD  %s" % df.get("build_text", "unknown"),
+                 th.fg if df.get("build_clean") else th.bad)
         return y
 
     def _section(self, d, th, y, snap, who):
