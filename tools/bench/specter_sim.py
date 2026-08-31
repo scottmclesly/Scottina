@@ -353,6 +353,15 @@ def group_steps_text(index):
 # The payload hatch, step 4. The operator drives it by hand from the display,
 # so this rig must track WHICH hatch was told to move and in WHICH direction.
 # It reports intent. There is no position feedback on the bus.
+#: What SESSION_BEGIN does about the first step.
+#:
+#: A session that begins with no ACTIVE step gives the operator nothing to
+#: confirm, so this rig marks step 0 ACTIVE when the run starts. The display
+#: still overrides it with STEP_BEGIN for any step it names. IF THE DISPLAY
+#: IS MEANT TO CHOOSE THE FIRST STEP ITSELF, set this False: the reset is
+#: the part that is certainly correct, this line is the judgement call.
+SESSION_BEGIN_ACTIVATES_FIRST_STEP = True
+
 HATCH_STEP = 4
 HATCH_STOPPED = 0
 HATCH_OPENING = 1
@@ -478,6 +487,22 @@ class SimState:
             self.states[SHORE_LINK_SLOT] = value
             return True
 
+    def begin_session(self):
+        """Start a fresh checklist run. NOTHING IS INHERITED.
+
+        Same reasoning as the handshake: a run that begins by inheriting the
+        previous run's GOOD steps shows a checklist nobody performed. There
+        is nothing to carry over at the moment the operator presses Begin.
+        """
+        with self.lock:
+            self.states = [PENDING] * SPECTER_STEP_CAPACITY
+            self.operator_input_requested = False
+            self.hatch_cycle = None
+            self.hatch_port = HATCH_STOPPED
+            self.hatch_stbd = HATCH_STOPPED
+            if SESSION_BEGIN_ACTIVATES_FIRST_STEP:
+                self.states[0] = ACTIVE
+
     def walk_one_step(self):
         """Move the first step that is not GOOD one state forward.
 
@@ -545,7 +570,17 @@ class SimState:
                 % (step, SPECTER_STEP_CAPACITY))
             return
 
-        if event == int(SpecterEventType.STEP_BEGIN) and step != 0xFF:
+        if event == int(SpecterEventType.SESSION_BEGIN):
+            # THE OPERATOR PRESSED BEGIN, AND THIS RIG DID NOTHING.
+            #
+            # SESSION_BEGIN had no branch at all. `on_display_frame` still
+            # accepted the sequence, counted it and echoed it, so the display
+            # read its own action back as successful and moved on while the
+            # step table never changed. Every step stayed PENDING and the
+            # bench had nothing to witness. Silence is the worst possible
+            # answer here: a refusal would at least have shown up.
+            self.begin_session()
+        elif event == int(SpecterEventType.STEP_BEGIN) and step != 0xFF:
             self.set_step(step, ACTIVE)
             with self.lock:
                 self.operator_input_requested = False
@@ -560,12 +595,41 @@ class SimState:
             self.set_step(step, PENDING)
         elif event in ACTUATE_EVENTS:
             self._run_actuate(event, fields)
+        elif event == int(SpecterEventType.STEP_ABORT) and step != 0xFF:
+            # A STEP-level abort. It stops what this rig started on that step
+            # and returns the step to PENDING. It does NOT end the session:
+            # the operator aborts one test, not the run.
+            self.set_step(step, PENDING)
+            with self.lock:
+                self.operator_input_requested = False
+                if step == HATCH_STEP:
+                    self.hatch_cycle = None
+                    self.hatch_port = HATCH_STOPPED
+                    self.hatch_stbd = HATCH_STOPPED
         elif event == int(SpecterEventType.SESSION_ABORT):
             self.set_all(PENDING)
             with self.lock:
                 self.operator_input_requested = False
                 self.hatch_port = HATCH_STOPPED
                 self.hatch_stbd = HATCH_STOPPED
+        elif event == int(SpecterEventType.SESSION_COMPLETE):
+            # The operator declares the run finished. It marks NO step GOOD.
+            # The veto is derived from the step table, so setting steps here
+            # would clear the veto on a checklist nobody actually ran, which
+            # is the one thing the veto exists to prevent.
+            with self.lock:
+                self.operator_input_requested = False
+                self.hatch_cycle = None
+                self.hatch_port = HATCH_STOPPED
+                self.hatch_stbd = HATCH_STOPPED
+        elif event != int(SpecterEventType.NONE):
+            # NEVER FAIL SILENTLY AGAIN. Three event types fell off the end
+            # of this chain and the only symptom was a checklist that would
+            # not move. An unhandled action is a bench finding, so say it.
+            say("UNHANDLED event %s (%d), step %s. This rig echoed the "
+                "sequence, so the DISPLAY believes the action ran. Nothing "
+                "changed here." % (event_name(event), event,
+                                   "none" if step == 0xFF else step))
 
     def _run_actuate(self, event, fields):
         """Drive the payload hatches from one actuate event.

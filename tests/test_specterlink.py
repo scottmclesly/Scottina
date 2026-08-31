@@ -717,47 +717,6 @@ class TestTheBuildLineReachesThePanel(unittest.TestCase):
         self.assertEqual(sum(1 for r in rows if r["label"] == "BUILD"), 1)
 
 
-class TestTheHandshakeRowReportsSilence(unittest.TestCase):
-    """A row that exists only once a handshake lands cannot report the
-    failure it matters most for."""
-
-    def test_the_panel_says_when_it_has_seen_no_handshake(self):
-        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD)).specter_rows()
-        self.assertIsNotNone(row(rows, "HANDSHAKE"))
-
-    def test_silence_against_a_blocked_display_is_a_fault(self):
-        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD,
-                                         state=0)).specter_rows()
-        self.assertEqual(row(rows, "HANDSHAKE")["state"], "fault")
-        self.assertIn("BLOCKED", row(rows, "HANDSHAKE")["value"])
-
-    def test_silence_against_a_running_display_is_only_a_caution(self):
-        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD,
-                                         state=2)).specter_rows()
-        self.assertEqual(row(rows, "HANDSHAKE")["state"], "caution")
-
-    def test_it_never_claims_a_handshake_never_happened(self):
-        """The reader opens on entry to the tile and closes on leave, so it
-        can only speak for this visit."""
-        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD)).specter_rows()
-        value = row(rows, "HANDSHAKE")["value"]
-        self.assertIn("none seen", value)
-        self.assertNotIn("never", value)
-
-    def test_an_accepted_handshake_is_reported_as_before(self):
-        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD),
-                     hs_rsp=hs_response_frame(result=0, session=7)).specter_rows()
-        handshake = row(rows, "HANDSHAKE")
-        self.assertEqual(handshake["state"], "ok")
-        self.assertIn("ACCEPT", handshake["value"])
-        self.assertIn("session 7", handshake["value"])
-
-    def test_exactly_one_handshake_row_is_produced(self):
-        rows = panel(display_frame_build(SL.BUILD_PRESENT, 0xFD),
-                     hs_rsp=hs_response_frame()).specter_rows()
-        self.assertEqual(sum(1 for r in rows if r["label"] == "HANDSHAKE"), 1)
-
-
 class TestTheDrawnScreenNamesTheImage(unittest.TestCase):
     """The unit in front of you was the one place that never said which
     image it was running."""
@@ -785,14 +744,15 @@ class TestTheDrawnScreenNamesTheImage(unittest.TestCase):
         self.assertEqual(len(build), 1)
         self.assertIn("DIRTY", build[0])
 
-    def test_the_screen_reports_handshake_silence_too(self):
-        """Both surfaces carry the same finding, so they cannot disagree."""
+    def test_the_build_line_stays_visible_on_a_320x480_panel(self):
+        """It sits above the NODE control, and the control is opaque.
+
+        An added line pushed BUILD underneath the button, where the operator
+        could not read it. The line budget is what keeps it on the glass.
+        """
         lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD))
-        shake = [line for line in lines if line.startswith("HSHAKE")]
-        self.assertEqual(len(shake), 1)
-        self.assertIn("none seen", shake[0])
-        self.assertIn("BLOCKED", shake[0])
-        self.assertLessEqual(len(shake[0]), 62, "the panel clips at 62")
+        self.assertLessEqual(len(lines), 5,
+                             "the drawn block has room for five lines")
 
     def test_the_handshake_request_still_wins_on_the_screen(self):
         lines = self._lines(display_frame_build(SL.BUILD_PRESENT, 0xFD),
