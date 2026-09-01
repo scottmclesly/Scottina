@@ -206,6 +206,67 @@ TELEMETRY_FAST_PERIOD_S = 0.1
 
 TID_VOLTAGE = 0x1401
 TID_RELAY_STATE = 0x1400
+
+# --------------------------------------------------------------------------
+# The command loop. Throttle and rudder, commanded and echoed.
+# --------------------------------------------------------------------------
+# TID_SPECIFICATION.md gives all four: 0x0400 and 0x0402 are the COMMANDS,
+# 0x0500 and 0x0502 are the ToCAN's report of what it is sending to the
+# hardware. Every one is "From: Brain, Rate: 10 Hz".
+#
+# BRAIN IS SOURCE 0x01. The name "Brain" is not in BEN_TOCAN_SOURCE_IDS.md,
+# so it was read across instead of guessed: can_node.cpp sends the same two
+# commands as can_.send(0x0040001, ...) and can_.send(0x0040201, ...), which
+# split as tid 0x0400 and 0x0402 with source 0x01, the Control Node. The
+# specification and the source agree, so the address is quoted, not chosen.
+#
+# THE DISPLAY DRAWS NONE OF THESE FOUR, AND THAT IS THE POINT OF SENDING
+# THEM. `gaugebar4Steering` and `gaugebar18Throttle` stay NO DATA, because
+# TID_SPECIFICATION.md 0x0500 says what the number is: "This is not what the
+# engine is currently doing, this is what is being sent to the engine from
+# the ToCAN." The rig sends them so the bench can watch the command loop run
+# and confirm the gauges IGNORE it. A gauge that started moving when these
+# arrived would be the defect, not the fix.
+BRAIN_SOURCE = 0x01
+
+# THE ECHO FOLLOWS ITS COMMAND. It is not a second wiggle.
+#
+# Each value here takes the value of the tid it maps to, so 0x0500 always
+# reports what 0x0400 just commanded. Giving the echo its own sine would put
+# a different number on the two frames, and a bench watching the loop would
+# see a disagreement the vessel never has. The rig must not invent a fault.
+ECHO_OF = {
+    0x0500: 0x0400,
+    0x0502: 0x0402,
+}
+
+# THE COMMAND LOOP IS HARD LIMITED, BECAUSE ITS OUT-OF-RANGE VALUES MEAN
+# SOMETHING.
+#
+# Every other value in this file is bounded by its sine alone, and drifting a
+# little past a plausible reading only looks odd. These four are different:
+# TID_SPECIFICATION.md gives 0x0400, 0x0402, 0x0500 and 0x0502 the SAME
+# out-of-range vocabulary, and it is not decoration.
+#
+#     0 to 100        a real throttle command
+#     -100 to 100     a real rudder command
+#     101 to 254      ERROR
+#     0xFF            NO COMMAND
+#
+# `wiggle <gain>` multiplies the swing by up to 3, so an unclamped rudder
+# reached +/-240 and an unclamped throttle reached 150. Both land inside the
+# ERROR band, and a rig that transmits ERROR while nothing is wrong teaches
+# the bench to ignore the one value that matters.
+#
+# So the clamp is on the VALUE, after the gain, and it is not negotiable.
+# Injecting a real ERROR or a real NO COMMAND is a fault-injection job and
+# belongs behind a flag, never behind the demonstration wiggle.
+VALUE_LIMITS = {
+    (0x0400, 'throttle'): (0.0, 100.0),
+    (0x0500, 'throttle'): (0.0, 100.0),
+    (0x0402, 'steering'): (-100.0, 100.0),
+    (0x0502, 'steering'): (-100.0, 100.0),
+}
 # Both come from a ToCAN device. The Switching ToCAN device, 0x81, owns the
 # relays and the power management sensors. Source: BEN_TOCAN_SOURCE_IDS.md.
 SWITCHING_SOURCE = 0x81          # the 10 Hz messages
@@ -281,6 +342,17 @@ TELEMETRY_TABLE = (
      'engine torque %'),                    # 12 to 48 %
     (0x180F, YANMAR_SOURCE, 'oil_temperature',       70.0,   5.0,  0.1,
      'transmission oil temperature degC'),  # 65 to 75 degC
+
+    # The command loop. See BRAIN_SOURCE above. THE DISPLAY MUST IGNORE
+    # ALL FOUR: they carry a command, never a measured position.
+    (0x0400, BRAIN_SOURCE,  'throttle',              45.0,  35.0,  0.1,
+     'throttle COMMAND %'),                 # 10 to 80 %
+    (0x0500, BRAIN_SOURCE,  'throttle',              45.0,  35.0,  0.1,
+     'throttle command ECHO %'),            # the same band, one phase apart
+    (0x0402, BRAIN_SOURCE,  'steering',               0.0,  80.0,  0.1,
+     'rudder COMMAND %, - port + stbd'),    # -80 to +80 %
+    (0x0502, BRAIN_SOURCE,  'steering',               0.0,  80.0,  0.1,
+     'rudder command ECHO %, - port + stbd'),
 )
 
 # The scales are NOT repeated here. They come from the shared codec, which
@@ -502,6 +574,38 @@ class SimState:
             self.hatch_stbd = HATCH_STOPPED
             if SESSION_BEGIN_ACTIVATES_FIRST_STEP:
                 self.states[0] = ACTIVE
+
+    def cycle_one_step(self, step):
+        """Move ONE step to the next of the four wire states. Return the name.
+
+        PENDING -> ACTIVE -> GOOD -> FAULT -> PENDING, for ever.
+
+        WHY THIS EXISTS AND `walk` DOES NOT COVER IT. `walk_one_step` runs a
+        checklist the way an operator runs it, so it stops at GOOD and never
+        produces FAULT. That is correct for a checklist and useless for
+        proving a renderer: a twenty second capture held 99 IDENTICAL status
+        frames, so three of the four step states had never been on the glass
+        at all, and nobody could say whether the display drew them.
+
+        This walks the STATE MACHINE instead of the checklist. It is a
+        rendering proof and it is not a session. It reports FAULT during a
+        live session, which the node never does. See "FAULT semantics" in
+        CLAUDE.md: a real FAULT is written on session termination.
+
+        `operator_input_requested` follows ACTIVE, because that is the only
+        state where the node waits for the operator.
+        """
+        order = (PENDING, ACTIVE, GOOD, FAULT)
+        with self.lock:
+            if not 0 <= step < SPECTER_STEP_CAPACITY:
+                return None
+            try:
+                nxt = order[(order.index(self.states[step]) + 1) % len(order)]
+            except ValueError:
+                nxt = PENDING
+            self.states[step] = nxt
+            self.operator_input_requested = (nxt == ACTIVE)
+            return STEP_STATES[nxt]
 
     def walk_one_step(self):
         """Move the first step that is not GOOD one state forward.
@@ -890,6 +994,18 @@ class TelemetryState:
             self.wiggle = self.gain > 0.0
             return self.gain
 
+    @staticmethod
+    def _limited(key, value):
+        """Hold one value inside its documented range. Call it holding the lock.
+
+        Only the command loop has limits. See VALUE_LIMITS for why those four
+        cannot be allowed out of range and every other value can.
+        """
+        limits = VALUE_LIMITS.get(key)
+        if limits is None:
+            return value
+        return max(limits[0], min(limits[1], value))
+
     def wiggled(self, centre, swing, seed):
         """A bounded sine about `centre`. Call it holding the lock.
 
@@ -910,10 +1026,20 @@ class TelemetryState:
             self.elapsed += seconds
             for tid, _src, field, centre, swing, _rate, _lab in TELEMETRY_TABLE:
                 key = (tid, field)
+                if tid in ECHO_OF:
+                    # Copied below, after every command has its new value.
+                    continue
                 if swing is None:
                     # A value that must not move, such as an hour meter.
                     continue
-                self.values[key] = self.wiggled(centre, swing, tid)
+                self.values[key] = self._limited(
+                    key, self.wiggled(centre, swing, tid))
+            # THE ECHO IS COPIED, NEVER COMPUTED. It reports what the command
+            # says, so the two frames can never disagree on the bench.
+            for tid, _src, field, _c, _w, _rate, _lab in TELEMETRY_TABLE:
+                if tid in ECHO_OF:
+                    self.values[(tid, field)] = self.values[
+                        (ECHO_OF[tid], field)]
 
     def snapshot(self):
         with self.lock:
@@ -1282,6 +1408,9 @@ HELP_TEXT = "\n".join([
     "                    step is 0 to %d" % (SPECTER_STEPS_IN_USE - 1),
     "  all <state>       set every step. Example: all PENDING",
     "  walk              move the first step that is not GOOD one forward",
+    "  cycle <step>      move ONE step to the next of PENDING ACTIVE GOOD",
+    "                    FAULT. A RENDERING PROOF, not a session: a live",
+    "                    node never sends FAULT while a session runs",
     "  shore on|off      set the shore link, slot %d. Not a step."
     % SHORE_LINK_SLOT,
     "  fuel <percent>    set the fuel level, 0 to 100. Example: fuel 42",
@@ -1409,6 +1538,25 @@ def handle_command(state, stop_event, line):
 
     if head == "show":
         show_outgoing(state, "Current state.")
+        return
+
+    if head == "cycle":
+        if len(parts) < 2:
+            say("Use: cycle <step>, 0 to %d. It moves that step to the next "
+                "of PENDING ACTIVE GOOD FAULT." % (SPECTER_STEPS_IN_USE - 1))
+            return
+        step = step_index(parts[1]) if parts[1].lower().startswith("s") \
+            else None
+        if step is None:
+            try:
+                step = int(parts[1])
+            except ValueError:
+                step = None
+        if step is None or not 0 <= step < SPECTER_STEPS_IN_USE:
+            say("The step must be 0 to %d." % (SPECTER_STEPS_IN_USE - 1))
+            return
+        name = state.cycle_one_step(step)
+        show_outgoing(state, "Cycle: step %d is now %s." % (step, name))
         return
 
     if head == "walk":
@@ -1557,6 +1705,15 @@ def main():
     parser.add_argument("--walk-period", type=float, default=0.0,
                         help="Move one step forward every S seconds. "
                              "0 means do not walk.")
+    parser.add_argument("--cycle-step", type=int, default=-1,
+                        help="Walk ONE step through all four wire states, "
+                             "PENDING ACTIVE GOOD FAULT, for ever. This is a "
+                             "RENDERING PROOF, not a session: the node never "
+                             "reports FAULT while a session runs. "
+                             "-1 means do not cycle.")
+    parser.add_argument("--cycle-period", type=float, default=2.0,
+                        help="Seconds between the states of --cycle-step. "
+                             "Long enough to read the screen. Default 2.")
 
     faults = parser.add_argument_group("fault injection")
     faults.add_argument("--refuse-handshake", choices=sorted(RESULT_BY_NAME),
@@ -1574,6 +1731,18 @@ def main():
                              "in the handshake response. The display must "
                              "refuse it, not resize its table.")
     args = parser.parse_args()
+
+    # REFUSE A BAD ARGUMENT BEFORE ANY SOCKET IS OPENED. A check that runs
+    # after the sockets are up makes the operator wait for a failure the
+    # command line already showed, and it leaves two open sockets on the way
+    # out. Argparse cannot express these two rules, so they live here, first.
+    if args.cycle_step >= 0 and not 0 <= args.cycle_step < SPECTER_STEPS_IN_USE:
+        say("ERROR: --cycle-step must be 0 to %d. It names a checklist step."
+            % (SPECTER_STEPS_IN_USE - 1))
+        return 2
+    if args.cycle_step >= 0 and args.cycle_period <= 0:
+        say("ERROR: --cycle-period must be above 0 seconds.")
+        return 2
 
     try:
         rx_sock = open_rx_socket(args.interface)
@@ -1662,6 +1831,26 @@ def main():
             stop_event.wait(args.duration)
             stop_event.set()
         threading.Thread(target=stop_later, daemon=True).start()
+
+    if args.cycle_step >= 0:
+        def cycle_later():
+            """Drive one step round the four states, for ever.
+
+            It never stops on its own. A rendering proof that ended after one
+            pass would leave the bench looking at whatever state it stopped
+            in, and the person watching would have to restart the rig to see
+            the next one.
+            """
+            while not stop_event.is_set():
+                stop_event.wait(args.cycle_period)
+                if stop_event.is_set():
+                    return
+                name = state.cycle_one_step(args.cycle_step)
+                say("Cycle: step %d is now %s." % (args.cycle_step, name))
+        threading.Thread(target=cycle_later, daemon=True).start()
+        say("Cycling step %d through PENDING ACTIVE GOOD FAULT every %.1f s."
+            % (args.cycle_step, args.cycle_period))
+        say("  This is a RENDERING PROOF. A live node never sends FAULT.")
 
     if args.walk_period > 0:
         def walk_later():
