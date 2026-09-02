@@ -111,6 +111,7 @@ try:
         step_name,
     )
     from specter_pkg.tocan_codec import encode_physical, encode_raw
+    from specter_pkg.specter_session import SpecterSession
     from specter_pkg.tocan_ids import ToCanTid
     from specter_pkg.tocan_ids import (
         DISPLAY_CAN_SOURCE,
@@ -474,8 +475,27 @@ class SimState:
         self.lock = threading.Lock()
         self.states = [PENDING] * SPECTER_STEP_CAPACITY
         self.protocol_version = protocol_version
-        self.session_id = session_id
         self.checklist_version = checklist_version
+        #
+        # THE SESSION IS REAL NOW, AND 0x0000 MEANS NO SESSION.
+        #
+        # `self.session_id` used to be a fixed number off the command line,
+        # so this rig reported session 1 from the moment it started and went
+        # on reporting it for ever. A bench watching the node side could not
+        # tell a logged-in operator from a display sitting on the logo, and
+        # A WRONG PIN LOOKED EXACTLY LIKE A CORRECT ONE.
+        #
+        # The counter rule is decisions D12 and D14, and it is NOT written
+        # again here: `SpecterSession` in the display repository is the one
+        # place the node generates a session id, and this rig imports it.
+        # A second copy of a counter is a second answer.
+        self.session = SpecterSession(checklist_id=checklist_version)
+        #: Seeded from --session-id so the first session can be forced to a
+        #: known value for a capture. It is the COUNTER, not the current id.
+        for _ in range(max(0, int(session_id) - 1)):
+            self.session.begin_session()
+        if int(session_id) > 0:
+            self.session.end_session()
         self.hold_echo = hold_echo
         self.event_echo = 0
         self.operator_input_requested = False
@@ -489,9 +509,48 @@ class SimState:
         self.hatch_cycle = None
         self.events_run = 0
         self.handshakes_answered = 0
+        # WHAT THE DISPLAY LAST ASKED FOR, so the tile can show a login
+        # happening instead of only its result. None until the first event.
+        self.last_event = None
+        self.last_event_step = 0xFF
         # What the DISPLAY last told each hatch to do. Not where it is.
         self.hatch_port = HATCH_STOPPED
         self.hatch_stbd = HATCH_STOPPED
+
+    def session_report(self):
+        """Everything the tile shows about the session, in one lock."""
+        with self.lock:
+            last = self.last_event
+            last_step = self.last_event_step
+            echo = self.event_echo
+            states = list(self.states)
+            waiting = self.operator_input_requested
+        # EVERY ACTIVE STEP, NOT THE FIRST ONE. Reporting only the first hid
+        # the step the operator had just begun: SESSION_BEGIN marks step 0
+        # ACTIVE, so a STEP_BEGIN on step 1 left the tile still naming
+        # step 0 while the operator worked on another screen.
+        active = [i for i in range(SPECTER_STEPS_IN_USE)
+                  if states[i] == ACTIVE]
+        return {
+            "active_steps": active,
+            "running": self.session.session_is_running,
+            "session_id": self.session.session_id,
+            "checklist_id": self.checklist_version,
+            "last_event": last,
+            "last_event_step": last_step,
+            "echo": echo,
+            "active_step": active[0] if active else None,
+            "waiting": waiting,
+        }
+
+    @property
+    def session_id(self):
+        """The CURRENT session, or 0x0000 while none runs."""
+        return self.session.session_id
+
+    @property
+    def session_is_running(self):
+        return self.session.session_is_running
 
     def snapshot(self):
         with self.lock:
@@ -574,6 +633,10 @@ class SimState:
             self.hatch_stbd = HATCH_STOPPED
             if SESSION_BEGIN_ACTIVATES_FIRST_STEP:
                 self.states[0] = ACTIVE
+        # THE SESSION ID ADVANCES HERE AND NOWHERE ELSE. It is outside the
+        # lock because SpecterSession holds its own state and this rig must
+        # not take two locks in one path.
+        self.session.begin_session()
 
     def cycle_one_step(self, step):
         """Move ONE step to the next of the four wire states. Return the name.
@@ -667,6 +730,9 @@ class SimState:
     def _run_event(self, fields):
         """Apply one operator action to the checklist state."""
         event = fields["event_type"]
+        with self.lock:
+            self.last_event = event
+            self.last_event_step = fields["step_index"]
         step = fields["step_index"]
 
         if step != 0xFF and step >= SPECTER_STEP_CAPACITY:
@@ -716,6 +782,9 @@ class SimState:
                 self.operator_input_requested = False
                 self.hatch_port = HATCH_STOPPED
                 self.hatch_stbd = HATCH_STOPPED
+            # The run is over. The id returns to 0x0000, and the COUNTER
+            # keeps its place so the next session takes the next value.
+            self.session.end_session()
         elif event == int(SpecterEventType.SESSION_COMPLETE):
             # The operator declares the run finished. It marks NO step GOOD.
             # The veto is derived from the step table, so setting steps here
@@ -726,6 +795,7 @@ class SimState:
                 self.hatch_cycle = None
                 self.hatch_port = HATCH_STOPPED
                 self.hatch_stbd = HATCH_STOPPED
+            self.session.end_session()
         elif event != int(SpecterEventType.NONE):
             # NEVER FAIL SILENTLY AGAIN. Three event types fell off the end
             # of this chain and the only symptom was a checklist that would

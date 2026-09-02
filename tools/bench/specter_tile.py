@@ -481,6 +481,52 @@ def build_tile(interface, started, state, rx_stats, tx_stats, health, log,
         lines.append("   %-9s%s" % ("state", "no heartbeat decoded yet"))
 
     lines.append(rule("-"))
+    lines.append(palette.paint(
+        " SESSION   what the node believes about this run", Palette.CYAN))
+    #
+    # WHY THIS BLOCK EXISTS. The tile showed nothing about the session, so a
+    # login could not be watched from the node side at all. A WRONG PIN AND A
+    # CORRECT ONE LOOKED IDENTICAL: no SESSION_BEGIN arrives for a wrong PIN,
+    # and with nothing on screen reporting the session there was no way to
+    # see that difference.
+    #
+    # 0x0000 IS RESERVED AND MEANS NO SESSION. Decisions D12 and D14. So "no
+    # session" is a value the node reports, never an absence of one.
+    report = state.session_report()
+    if report["running"]:
+        session_badge = palette.paint("ACTIVE", Palette.GREEN)
+        session_text = "0x%04X" % report["session_id"]
+    else:
+        session_badge = palette.paint("NO SESSION", Palette.YELLOW)
+        session_text = "0x0000  reserved, and it means no run is open"
+    lines.append("   %-9s%s   %s" % ("state", session_badge, session_text))
+    lines.append("   %-9schecklist 0x%04X   the step table both ends agreed"
+                 % ("ids", report["checklist_id"]))
+
+    if report["last_event"] is None:
+        event_text = "none yet. The display has sent no operator action"
+    else:
+        event_text = "%s (%d)" % (specter_sim.event_name(report["last_event"]),
+                                  report["last_event"])
+        if report["last_event_step"] != 0xFF:
+            event_text += "  step %d" % report["last_event_step"]
+    lines.append("   %-9s%s" % ("last ev", event_text))
+    lines.append("   %-9s%d%s" % ("echo", report["echo"],
+                                  "   0 means nothing outstanding"
+                                  if report["echo"] == 0 else ""))
+
+    active = report["active_steps"]
+    if not active:
+        step_text = "no step is ACTIVE"
+    else:
+        step_text = "  ".join(
+            "%d %s ACTIVE" % (i, specter_sim.step_name(i)) for i in active)
+        if report["waiting"]:
+            step_text += palette.paint("   waiting for the operator",
+                                       Palette.YELLOW)
+    lines.append("   %-9s%s" % ("step", step_text))
+
+    lines.append(rule("-"))
     lines.append(palette.paint(" TRANSMIT  node status 0x%06X   every %d ms"
                                % (TX_CAN_ID, int(specter_sim.TX_PERIOD_S * 1000)),
                                Palette.CYAN))
