@@ -230,6 +230,52 @@ TID_RELAY_STATE = 0x1400
 # arrived would be the defect, not the fix.
 BRAIN_SOURCE = 0x01
 
+# --------------------------------------------------------------------------
+# The automatic system test, step 0. THE RIG EMULATES EVERY SUBSYSTEM.
+# --------------------------------------------------------------------------
+# Scottina cannot query real bus devices, so it EMULATES them. The node then
+# sees heartbeats arrive and passes HONESTLY, rather than hardcoding a pass.
+#
+# THE DIFFERENCE BETWEEN AN EMULATOR AND A LIE is that an emulator can be
+# switched off. `silence <name>` stops one of these, and the node must then
+# fail that check. If it does not, the node has an assume-ready path and the
+# whole test is a decoration.
+#
+# ToCAN units  HEARTBEAT, TID 0x0000, from 0x91 to 0x94.
+#              SCOTT'S DESIGNATION. These four are NOT in
+#              BEN_TOCAN_SOURCE_IDS.md, which assigns nothing in 0x9x.
+# ROS          HEARTBEAT from 0x02, the Mode Control Node. Ben's list.
+# MAVLINK      A ROS TOPIC IN PRODUCTION, mavlink/heartbeat. BEN OWES IT.
+#              There is no ToCAN identifier for it and none is invented: the
+#              rig sends a heartbeat from a BENCH-ONLY source and the node
+#              accepts it only in bench mode. On the vessel the node reads
+#              the topic and this source means nothing.
+# EGES         0x1401 Voltage Measurement, one per stud. BEN OWES THE MAP.
+#              Studs 9, 10 and 11 stand for payload_battery_1 to 3 under the
+#              agreed schema. They are not confirmed hardware.
+TID_HEARTBEAT = 0x0000
+
+TOCAN_UNIT_SOURCES = (0x91, 0x92, 0x93, 0x94)
+ROS_HEARTBEAT_SOURCE = 0x02
+
+#: BENCH ONLY. It stands in for the ROS topic mavlink/heartbeat until Ben
+#: lands it. It is not a vessel address and it is not in Ben's list.
+BENCH_MAVLINK_SOURCE = 0x95
+
+#: The EGES studs, reported through 0x1401 with a voltage source id.
+EGES_STUD_IDS = (9, 10, 11)
+EGES_STUD_LABELS = {
+    9: "payload_battery_1",
+    10: "payload_battery_2",
+    11: "payload_battery_3",
+}
+EGES_STUD_VOLTS = 12.8
+
+#: Every subsystem the console can silence, and what stops when you do.
+SILENCEABLE = ("tocan", "ros", "mavlink", "eges")
+
+SYSTEM_TEST_PERIOD_S = 1.0
+
 # THE ECHO FOLLOWS ITS COMMAND. It is not a second wiggle.
 #
 # Each value here takes the value of the tid it maps to, so 0x0500 always
@@ -404,6 +450,10 @@ print_lock = threading.Lock()
 #: The telemetry the rig transmits. `main()` replaces it with the configured
 #: one. The console reaches it by name, exactly as it reaches the step state.
 TELEMETRY = None
+
+#: The emulated subsystems of the automatic system test. The console reaches
+#: it by name so `silence` and `restore` can switch one off and on.
+SYSTEM_TEST = None
 
 
 def say(text):
@@ -1173,6 +1223,91 @@ class TelemetryState:
             return self.values.get((tid, field), 0.0)
 
 
+class SystemTestEmulator:
+    """The four subsystems of the automatic system test, emulated.
+
+    IT MUST BE SWITCHABLE OR IT PROVES NOTHING. `silence` stops one source.
+    The node must then fail that check, and the display must name it. That is
+    the whole negative test.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.silenced = set()
+
+    def silence(self, name):
+        """Stop one subsystem. Return True if the name is known."""
+        name = name.lower()
+        if name not in SILENCEABLE:
+            return False
+        with self.lock:
+            self.silenced.add(name)
+        return True
+
+    def restore(self, name):
+        """Start one subsystem again, or all of them."""
+        name = name.lower()
+        with self.lock:
+            if name == "all":
+                self.silenced.clear()
+                return True
+            if name not in SILENCEABLE:
+                return False
+            self.silenced.discard(name)
+        return True
+
+    def is_silent(self, name):
+        with self.lock:
+            return name in self.silenced
+
+    def report(self):
+        with self.lock:
+            silenced = sorted(self.silenced)
+        return silenced
+
+    def frames(self):
+        """Build every frame the emulated subsystems send this period."""
+        out = []
+        if not self.is_silent("tocan"):
+            for source in TOCAN_UNIT_SOURCES:
+                out.append((((TID_HEARTBEAT << 8) | source), bytes(8),
+                            "ToCAN unit 0x%02X heartbeat" % source))
+        if not self.is_silent("ros"):
+            out.append((((TID_HEARTBEAT << 8) | ROS_HEARTBEAT_SOURCE),
+                        bytes(8), "ROS heartbeat, Mode Control Node"))
+        if not self.is_silent("mavlink"):
+            out.append((((TID_HEARTBEAT << 8) | BENCH_MAVLINK_SOURCE),
+                        bytes(8),
+                        "MAVLink heartbeat, BENCH STAND-IN for the topic"))
+        if not self.is_silent("eges"):
+            for stud in EGES_STUD_IDS:
+                data = encode_raw(TID_VOLTAGE,
+                                  voltage_source_id=stud,
+                                  voltage=int(round(EGES_STUD_VOLTS * 1000.0)))
+                out.append((((TID_VOLTAGE << 8) | SWITCHING_SOURCE), data,
+                            "EGES stud %d, %s"
+                            % (stud, EGES_STUD_LABELS[stud])))
+        return out
+
+
+def system_test_worker(sock, tx_lock, emulator, stop_event, link):
+    """Send the emulated subsystem heartbeats at 1 Hz.
+
+    It runs with the rig, so the panel NODE button gates it like everything
+    else. A silenced subsystem simply is not sent, which is exactly what a
+    dead one looks like on the bus.
+    """
+    while not stop_event.is_set():
+        if link is None or link.is_set():
+            for can_id, data, _label in emulator.frames():
+                try:
+                    with tx_lock:
+                        send_frame(sock, can_id, data)
+                except OSError:
+                    pass
+        stop_event.wait(SYSTEM_TEST_PERIOD_S)
+
+
 def telemetry_worker(sock, tx_lock, telemetry, stop_event, link):
     """Send the vessel telemetry at the rate each message documents.
 
@@ -1478,6 +1613,10 @@ HELP_TEXT = "\n".join([
     "                    step is 0 to %d" % (SPECTER_STEPS_IN_USE - 1),
     "  all <state>       set every step. Example: all PENDING",
     "  walk              move the first step that is not GOOD one forward",
+    "  systest           print the emulated system test sources",
+    "  silence <name>    stop one subsystem: %s" % ", ".join(SILENCEABLE),
+    "                    the node must then FAIL that check",
+    "  restore <name>    start it again. restore all restores every one",
     "  cycle <step>      move ONE step to the next of PENDING ACTIVE GOOD",
     "                    FAULT. A RENDERING PROOF, not a session: a live",
     "                    node never sends FAULT while a session runs",
@@ -1608,6 +1747,43 @@ def handle_command(state, stop_event, line):
 
     if head == "show":
         show_outgoing(state, "Current state.")
+        return
+
+    if head in ("silence", "restore"):
+        if len(parts) < 2:
+            say("Use: %s <%s>%s"
+                % (head, "|".join(SILENCEABLE),
+                   ", or restore all" if head == "restore" else ""))
+            return
+        name = parts[1].lower()
+        ok = (SYSTEM_TEST.silence(name) if head == "silence"
+              else SYSTEM_TEST.restore(name))
+        if not ok:
+            say("Unknown subsystem %r. One of: %s."
+                % (parts[1], ", ".join(SILENCEABLE)))
+            return
+        silent = SYSTEM_TEST.report()
+        say("%s %s. Silent now: %s."
+            % ("Silenced" if head == "silence" else "Restored", name,
+               ", ".join(silent) if silent else "nothing"))
+        if head == "silence":
+            say("  The node must FAIL that check, and the display must "
+                "name it. If it does not, the node has an assume-ready "
+                "path.")
+        return
+
+    if head == "systest":
+        silent = SYSTEM_TEST.report()
+        lines = ["-" * 66,
+                 "The automatic system test. The rig EMULATES every source.",
+                 "  silent : %s" % (", ".join(silent) if silent
+                                    else "nothing. Every subsystem answers")]
+        for can_id, _data, label in SYSTEM_TEST.frames():
+            lines.append("  0x%06X  %s" % (can_id, label))
+        if silent:
+            lines.append("  NOTE: a silenced subsystem sends NOTHING, which "
+                         "is what a dead one looks like.")
+        say("\n".join(lines))
         return
 
     if head == "cycle":
@@ -1832,7 +2008,8 @@ def main():
         "drop_status_after": args.drop_status_after,
     }
 
-    global TELEMETRY
+    global TELEMETRY, SYSTEM_TEST
+    SYSTEM_TEST = SystemTestEmulator()
     TELEMETRY = TelemetryState(fuel_percent=args.fuel,
                                volts=args.volts,
                                wiggle=not args.no_wiggle)
@@ -1890,11 +2067,16 @@ def main():
             target=telemetry_worker,
             args=(tx_sock, tx_lock, TELEMETRY, stop_event, link),
             name="telemetry", daemon=True)
+    system_test_thread = threading.Thread(
+        target=system_test_worker,
+        args=(tx_sock, tx_lock, SYSTEM_TEST, stop_event, link),
+        name="system-test", daemon=True)
 
     rx_thread.start()
     tx_thread.start()
     if telemetry_thread is not None:
         telemetry_thread.start()
+    system_test_thread.start()
 
     if args.duration > 0:
         def stop_later():
