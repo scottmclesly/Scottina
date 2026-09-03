@@ -110,7 +110,7 @@ try:
         encode_status_frame,
         step_name,
     )
-    from specter_pkg.tocan_codec import encode_physical, encode_raw
+    from specter_pkg.tocan_codec import decode_raw, encode_physical, encode_raw
     from specter_pkg.specter_session import SpecterSession
     from specter_pkg.tocan_ids import ToCanTid
     from specter_pkg.tocan_ids import (
@@ -255,15 +255,35 @@ BRAIN_SOURCE = 0x01
 #              agreed schema. They are not confirmed hardware.
 TID_HEARTBEAT = 0x0000
 
-TOCAN_UNIT_SOURCES = (0x91, 0x92, 0x93, 0x94)
-ROS_HEARTBEAT_SOURCE = 0x02
+# THE NODE'S OWN SYSTEM TEST, IMPORTED. NOT REIMPLEMENTED.
+#
+# "Shared codec, two applications" is a locked rule. At STAGE 1 Scottina is
+# the node as well as every device, so the check logic it runs must be the
+# SAME code `specter_pkg` runs at stage 2. A second copy here would pass this
+# bench and prove nothing about the node, which is the exact migration risk
+# the stage list names.
+#
+# The constants come from the node too. The rig SENDS from these sources and
+# the node CHECKS these sources, so one definition means the two ends cannot
+# drift apart and silently agree on nothing.
+from specter_pkg.specter_system_test import (          # noqa: E402
+    EGES_STUD_IDS,
+    FIRST_ANSWER_GRACE_S,
+    ROS_SOURCE,
+    SYSTEM_TEST_SLOT_BASE,
+    SpecterSystemTest,
+    Subsystem,
+    TOCAN_UNIT_SOURCES,
+)
+
+ROS_HEARTBEAT_SOURCE = ROS_SOURCE
 
 #: BENCH ONLY. It stands in for the ROS topic mavlink/heartbeat until Ben
 #: lands it. It is not a vessel address and it is not in Ben's list.
 BENCH_MAVLINK_SOURCE = 0x95
 
 #: The EGES studs, reported through 0x1401 with a voltage source id.
-EGES_STUD_IDS = (9, 10, 11)
+
 EGES_STUD_LABELS = {
     9: "payload_battery_1",
     10: "payload_battery_2",
@@ -275,6 +295,10 @@ EGES_STUD_VOLTS = 12.8
 SILENCEABLE = ("tocan", "ros", "mavlink", "eges")
 
 SYSTEM_TEST_PERIOD_S = 1.0
+
+#: The checklist step the automatic system test runs. Slot 0 in the packed
+#: table. The RESULTS ride in slots 14 to 17, which are not checklist steps.
+SYSTEM_TEST_STEP = 0
 
 # THE ECHO FOLLOWS ITS COMMAND. It is not a second wiggle.
 #
@@ -566,6 +590,14 @@ class SimState:
         # What the DISPLAY last told each hatch to do. Not where it is.
         self.hatch_port = HATCH_STOPPED
         self.hatch_stbd = HATCH_STOPPED
+        # THE NODE SIDE OF THE AUTOMATIC SYSTEM TEST.
+        #
+        # It is `specter_pkg`'s own class, run here because at STAGE 1 this
+        # rig IS the node. It is fed from the bus by `system_test_monitor`,
+        # never from the emulator's own `silenced` set: reading the set would
+        # prove the rig agrees with itself, and it would have reported four
+        # healthy subsystems while the emitter thread was dead.
+        self.checks = SpecterSystemTest()
 
     def session_report(self):
         """Everything the tile shows about the session, in one lock."""
@@ -791,6 +823,10 @@ class SimState:
             return
 
         if event == int(SpecterEventType.SESSION_BEGIN):
+            # SESSION_BEGIN marks step 0 ACTIVE, so the automatic test starts
+            # with it. `begin` takes the clock, so the first-answer grace runs
+            # from the moment the operator pressed the key.
+            self.checks.begin(time.monotonic())
             # THE OPERATOR PRESSED BEGIN, AND THIS RIG DID NOTHING.
             #
             # SESSION_BEGIN had no branch at all. `on_display_frame` still
@@ -804,6 +840,11 @@ class SimState:
             self.set_step(step, ACTIVE)
             with self.lock:
                 self.operator_input_requested = False
+            if step == SYSTEM_TEST_STEP:
+                # RESTART TEST RESTARTS THE TEST. Without this the grace
+                # window and every seen-at time carried over from the last
+                # run, so a restart reported the OLD answer at once.
+                self.checks.begin(time.monotonic())
             if step == HATCH_STEP:
                 self.start_hatch_cycle()
         elif event == int(SpecterEventType.STEP_CONFIRM) and step != 0xFF:
@@ -811,8 +852,12 @@ class SimState:
             self.set_step(step, GOOD)
             with self.lock:
                 self.operator_input_requested = False
+            if step == SYSTEM_TEST_STEP:
+                self.checks.stop()
         elif event == int(SpecterEventType.STEP_RERUN) and step != 0xFF:
             self.set_step(step, PENDING)
+            if step == SYSTEM_TEST_STEP:
+                self.checks.stop()
         elif event in ACTUATE_EVENTS:
             self._run_actuate(event, fields)
         elif event == int(SpecterEventType.STEP_ABORT) and step != 0xFF:
@@ -820,6 +865,8 @@ class SimState:
             # and returns the step to PENDING. It does NOT end the session:
             # the operator aborts one test, not the run.
             self.set_step(step, PENDING)
+            if step == SYSTEM_TEST_STEP:
+                self.checks.stop()
             with self.lock:
                 self.operator_input_requested = False
                 if step == HATCH_STEP:
@@ -828,6 +875,7 @@ class SimState:
                     self.hatch_stbd = HATCH_STOPPED
         elif event == int(SpecterEventType.SESSION_ABORT):
             self.set_all(PENDING)
+            self.checks.stop()
             with self.lock:
                 self.operator_input_requested = False
                 self.hatch_port = HATCH_STOPPED
@@ -836,6 +884,7 @@ class SimState:
             # keeps its place so the next session takes the next value.
             self.session.end_session()
         elif event == int(SpecterEventType.SESSION_COMPLETE):
+            self.checks.stop()
             # The operator declares the run finished. It marks NO step GOOD.
             # The veto is derived from the step table, so setting steps here
             # would clear the veto on a checklist nobody actually ran, which
@@ -976,6 +1025,26 @@ class SimState:
             echo = self.event_echo
             operator_input = self.operator_input_requested
             mode = self.vessel_mode
+
+        # THE AUTOMATIC SYSTEM TEST WRITES SLOTS 14 TO 17 AND NOTHING ELSE.
+        #
+        # They were never written at all: the rig packed 24 slots of which
+        # 14 to 17 were always PENDING, so `specter_syscheck_line` had no
+        # fault, no pass and no last-good and returned TESTING for ever.
+        #
+        # `operator_input_requested` for step 0 comes from the SAME object,
+        # so the flag and the four results cannot disagree. It used to come
+        # from the generic rule `nxt == ACTIVE`, which set it the moment the
+        # step went ACTIVE. The display then opened NEXT over a test that had
+        # produced no result at all, and the operator could confirm a check
+        # that never ran. That is worse than the screen sitting still.
+        now = time.monotonic()
+        if self.checks.running:
+            for slot, state in self.checks.slot_states(now).items():
+                states[slot] = int(state)
+            if states[SYSTEM_TEST_STEP] == ACTIVE:
+                operator_input = self.checks.operator_input_requested(now)
+
         veto = not all(state == GOOD
                        for state in states[:SPECTER_STEPS_IN_USE])
 
@@ -1005,6 +1074,7 @@ class SimState:
         still holds as accepted, and the rig ignores a live action.
         """
         result = refuse
+        restarted = False
         if result == int(SpecterHandshakeResult.ACCEPT):
             if request["protocol_version"] != self.protocol_version:
                 result = int(SpecterHandshakeResult.REJECT_PROTOCOL_VERSION)
@@ -1031,10 +1101,17 @@ class SimState:
                 self.operator_input_requested = False
                 self.hatch_port = HATCH_STOPPED
                 self.hatch_stbd = HATCH_STOPPED
+                restarted = True
             self.handshakes_answered += 1
             session_id = self.session_id
             checklist_id = self.checklist_version
             protocol_version = self.protocol_version
+
+        if restarted:
+            # A HANDSHAKE IS THE TWO ENDS AGREEING BEFORE THE RUN. There is
+            # nothing to inherit, and that includes the system test result.
+            # `stop` takes no lock of ours, so it runs outside the one above.
+            self.checks.stop()
 
         step_count = SPECTER_STEPS_IN_USE
         if bad_step_count:
@@ -1293,18 +1370,34 @@ class SystemTestEmulator:
 def system_test_worker(sock, tx_lock, emulator, stop_event, link):
     """Send the emulated subsystem heartbeats at 1 Hz.
 
-    It runs with the rig, so the panel NODE button gates it like everything
-    else. A silenced subsystem simply is not sent, which is exactly what a
-    dead one looks like on the bus.
-    """
-    while not stop_event.is_set():
+    A silenced subsystem simply is not sent, which is exactly what a dead one
+    looks like on the bus.
+
+    THE `link.is_set()` FAULT. This loop used to read
+
         if link is None or link.is_set():
-            for can_id, data, _label in emulator.frames():
-                try:
-                    with tx_lock:
-                        send_frame(sock, can_id, data)
-                except OSError:
-                    pass
+
+    and `link` is a DICT, not an Event. `dict` has no `is_set`, so the first
+    pass raised AttributeError and this daemon thread DIED. Nothing printed
+    it, so the rig looked healthy and the four heartbeats were never on the
+    bus at all. A capture showed sources 0x01, 0x20, 0x21, 0x81, 0x82 and
+    0x83 and nothing else. The display sat on TESTING for ever.
+
+    It is not gated now. `telemetry_worker` is not gated either, and the two
+    must behave the same way: they are both the RIG pretending to be devices.
+    """
+    del link
+    errors = 0
+    while not stop_event.is_set():
+        for can_id, data, _label in emulator.frames():
+            try:
+                with tx_lock:
+                    send_frame(sock, can_id, data)
+            except OSError as error:
+                errors += 1
+                if errors in (1, 10, 100):
+                    say("System test TX error (%d so far): %s"
+                        % (errors, error))
         stop_event.wait(SYSTEM_TEST_PERIOD_S)
 
 
@@ -1357,6 +1450,83 @@ def telemetry_worker(sock, tx_lock, telemetry, stop_event, link):
                         say('Telemetry TX error (%d so far): %s'
                             % (errors, error))
         stop_event.wait(TELEMETRY_FAST_PERIOD_S)
+
+
+def open_monitor_socket(interface):
+    """Open a socket that sees the system test evidence, and nothing else.
+
+    WHY A THIRD SOCKET. `open_rx_socket` filters down to the two display ids
+    so the printer only ever shows display traffic. Widening that filter would
+    put every heartbeat through the decode-and-print path. This socket carries
+    its own narrow filter instead, so the display path is untouched.
+
+    WHY IT READS THE BUS AT ALL. At stage 1 this rig sends the heartbeats and
+    also runs the node that checks them. It would be simpler for the node to
+    read the emulator's `silenced` set directly, AND IT WOULD PROVE NOTHING:
+    the rig would agree with itself. It reported four healthy subsystems for
+    days while the emitter thread was dead. So the node reads the WIRE. If a
+    frame is not on the bus, the check fails, whatever the rig believes it is
+    sending.
+
+    SocketCAN loops locally-sent frames back to every OTHER socket on the
+    interface, so the frames this rig transmits arrive here exactly as a real
+    device's would at stage 2.
+    """
+    sock = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+    mask = CAN_EFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG
+    watched = [(TID_HEARTBEAT << 8) | source
+               for source in TOCAN_UNIT_SOURCES]
+    watched.append((TID_HEARTBEAT << 8) | ROS_HEARTBEAT_SOURCE)
+    watched.append((TID_HEARTBEAT << 8) | BENCH_MAVLINK_SOURCE)
+    watched.append((TID_VOLTAGE << 8) | SWITCHING_SOURCE)
+    can_filters = b"".join(
+        struct.pack("=II", can_id | CAN_EFF_FLAG, mask)
+        for can_id in watched)
+    sock.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_FILTER, can_filters)
+    sock.bind((interface,))
+    sock.settimeout(0.5)
+    return sock
+
+
+def system_test_monitor(sock, state, stop_event):
+    """Feed the node's system test from the frames actually on the bus.
+
+    It notes evidence whether or not a test is running. `SpecterSystemTest`
+    refuses every note while it is stopped, so a heartbeat that arrived before
+    the operator pressed Begin cannot count as an answer to a test that had
+    not started.
+    """
+    while not stop_event.is_set():
+        try:
+            packet = sock.recv(CAN_FRAME_SIZE)
+        except socket.timeout:
+            continue
+        except OSError:
+            if not stop_event.is_set():
+                break
+            break
+
+        can_id, dlc, payload = struct.unpack(CAN_FRAME_FMT, packet)
+        can_id_clean = can_id & CAN_EFF_MASK
+        tid = (can_id_clean >> 8) & 0xFFFF
+        source = can_id_clean & 0xFF
+        now = time.monotonic()
+
+        if tid == TID_HEARTBEAT:
+            if source == BENCH_MAVLINK_SOURCE:
+                # BENCH ONLY. It stands in for the ROS topic
+                # mavlink/heartbeat, which Ben owes. 0x95 is NOT a vessel
+                # address and this branch does not exist at stage 2: the real
+                # node subscribes to the topic instead.
+                state.checks.note_mavlink(now)
+            else:
+                state.checks.note_heartbeat(source, now)
+        elif tid == TID_VOLTAGE:
+            try:
+                fields = decode_raw(TID_VOLTAGE, payload[:dlc])
+            except Exception:
+                continue
+            state.checks.note_voltage(fields["voltage_source_id"], now)
 
 
 def open_rx_socket(interface):
@@ -1772,6 +1942,46 @@ def handle_command(state, stop_event, line):
                 "path.")
         return
 
+    if head == "session":
+        # A BENCH LOGIN. It does what SESSION_BEGIN from the display does, so
+        # the whole chain can be driven with nobody at the keypad.
+        #
+        # IT IS NOT A SHORTCUT PAST THE PIN. The display still has to log in
+        # for ITS side of the session; this moves the NODE only. It exists
+        # because the negative tests must be repeatable, and a test that needs
+        # a person to press a key at the right moment is not.
+        want = parts[1].lower() if len(parts) > 1 else "show"
+        if want == "begin":
+            state.begin_session()
+            state.checks.begin(time.monotonic())
+            show_outgoing(state, "Session begun. Step 0 ACTIVE, system test "
+                                 "running.")
+        elif want in ("end", "abort"):
+            state.set_all(PENDING)
+            state.checks.stop()
+            state.session.end_session()
+            show_outgoing(state, "Session ended. Every step PENDING.")
+        else:
+            say("Use: session begin, or session end.")
+        return
+
+    if head == "checks":
+        # WHAT THE NODE MEASURED, from the frames on the WIRE.
+        now = time.monotonic()
+        if not state.checks.running:
+            say("The system test is not running. Use: session begin.")
+            return
+        lines = ["-" * 66,
+                 "The automatic system test, AS THE NODE READ IT OFF THE BUS."]
+        for sub, st in sorted(state.checks.states(now).items()):
+            lines.append("  slot %2d  %-8s %s"
+                         % (SYSTEM_TEST_SLOT_BASE + int(sub),
+                            sub.name, STEP_STATES[int(st)]))
+        lines.append("  operator_input_requested : %s"
+                     % state.checks.operator_input_requested(now))
+        say("\n".join(lines))
+        return
+
     if head == "systest":
         silent = SYSTEM_TEST.report()
         lines = ["-" * 66,
@@ -2071,12 +2281,18 @@ def main():
         target=system_test_worker,
         args=(tx_sock, tx_lock, SYSTEM_TEST, stop_event, link),
         name="system-test", daemon=True)
+    monitor_sock = open_monitor_socket(args.interface)
+    monitor_thread = threading.Thread(
+        target=system_test_monitor,
+        args=(monitor_sock, state, stop_event),
+        name="system-test-monitor", daemon=True)
 
     rx_thread.start()
     tx_thread.start()
     if telemetry_thread is not None:
         telemetry_thread.start()
     system_test_thread.start()
+    monitor_thread.start()
 
     if args.duration > 0:
         def stop_later():
