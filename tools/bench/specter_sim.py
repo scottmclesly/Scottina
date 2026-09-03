@@ -300,6 +300,42 @@ SYSTEM_TEST_PERIOD_S = 1.0
 #: table. The RESULTS ride in slots 14 to 17, which are not checklist steps.
 SYSTEM_TEST_STEP = 0
 
+#: `0x0402 Rudder Percentage Command`, from the DISPLAY at source 0x20.
+#:
+#: THE DISPLAY COMMANDS THE RUDDER NOW. Scott reversed the old rule on
+#: 2026-09-02. Marvin also sends 0x0402 from source 0x01, so this rig obeys
+#: whichever it saw last and says which one it was. TWO COMMANDERS ON ONE
+#: RUDDER IS A REAL QUESTION FOR THE VESSEL and it is not one the bench may
+#: answer.
+TID_RUDDER_COMMAND = 0x0402
+
+#: `0x1811 Rudder Percentage Feedback`. The MEASURED position, 10 Hz.
+TID_RUDDER_FEEDBACK = 0x1811
+
+#: The rig answers as a ToCAN device, the same source as the other 10 Hz
+#: measured values.
+RUDDER_FEEDBACK_SOURCE = 0x81   # SWITCHING_SOURCE, the 10 Hz device
+
+#: How fast the modelled ram travels, in percent of full travel per second.
+#:
+#: A FULL SWEEP MUST TAKE REAL TIME. Port to starboard is 200 percent of
+#: travel, so at 40 percent per second it takes five seconds and the whole
+#: sweep about ten. A rig that jumped the feedback to the commanded value
+#: would let the display finish a sweep in one slice, and every rule about
+#: watching the metal move would be untested.
+RUDDER_RATE_PERCENT_PER_S = 40.0
+
+#: `0xFF` is NO COMMAND. The ram then holds where it is.
+RUDDER_NO_COMMAND = 0xFF
+
+#: How long a command stands before the ram stops. The display sends at
+#: 10 Hz, so half a second is five missed frames.
+#:
+#: IT IS A HOLD, NOT A TIMEOUT ON THE SWEEP. The DISPLAY decides when its
+#: sweep is finished, from this feedback. This only says what a modelled ram
+#: does when nobody is commanding it any more, which is stop.
+RUDDER_COMMAND_HOLD_S = 0.5
+
 # THE ECHO FOLLOWS ITS COMMAND. It is not a second wiggle.
 #
 # Each value here takes the value of the tid it maps to, so 0x0500 always
@@ -478,6 +514,7 @@ TELEMETRY = None
 #: The emulated subsystems of the automatic system test. The console reaches
 #: it by name so `silence` and `restore` can switch one off and on.
 SYSTEM_TEST = None
+RUDDER = None
 
 
 def say(text):
@@ -1300,6 +1337,127 @@ class TelemetryState:
             return self.values.get((tid, field), 0.0)
 
 
+class RudderModel:
+    """A rudder that takes real time to move, and reports where it IS.
+
+    THE RIG HAD A HATCH CYCLE AND NO STEERING EQUIVALENT. The display now
+    commands the rudder directly with `0x0402` and finishes step 1 on the
+    MEASURED `0x1811` position, so without something here that actually moves
+    there was nothing for the display to measure and the step could not
+    complete at all.
+
+    IT MOVES TOWARD THE COMMAND AT A RATE. It does not jump. A rig that
+    snapped the feedback to the commanded value would let the display finish
+    a whole sweep inside one slice, and every rule about watching the metal
+    move would be proved against nothing.
+
+    THE POSITION IS THE ONLY OUTPUT. This class does not know what a sweep is
+    and must not: the sweep lives in the display, and a rig that understood
+    it would be a second implementation of the thing under test.
+    """
+
+    def __init__(self, position=0.0):
+        self.lock = threading.Lock()
+        self.position = float(position)
+        self.command = None          # None means nobody is commanding
+        self.command_at = None
+        self.command_source = None
+        self.frozen = False          # the bench can stop the feedback
+        self.moving = False
+
+    def note_command(self, percent, source, now):
+        """One 0x0402 arrived. `percent` is the raw byte."""
+        with self.lock:
+            if percent == RUDDER_NO_COMMAND:
+                self.command = None
+                self.command_at = None
+                self.command_source = source
+                return
+            value = percent - 256 if percent > 127 else percent
+            if not -100 <= value <= 100:
+                # 101 to 254 is ERROR in the specification. The rig REFUSES
+                # it rather than clamping: a clamp would let a wrong command
+                # look like a good one.
+                return
+            self.command = value
+            self.command_at = now
+            self.command_source = source
+
+    def advance(self, now, dt):
+        """Move toward the command. Return the position."""
+        with self.lock:
+            target = self.command
+            if (target is not None and self.command_at is not None
+                    and (now - self.command_at) > RUDDER_COMMAND_HOLD_S):
+                # NOBODY IS COMMANDING ANY MORE. The ram stops where it is.
+                # It does NOT spring back to centre.
+                target = None
+                self.command = None
+            if target is None:
+                self.moving = False
+                return self.position
+            step = RUDDER_RATE_PERCENT_PER_S * dt
+            gap = target - self.position
+            if abs(gap) <= step:
+                self.position = float(target)
+                self.moving = False
+            else:
+                self.position += step if gap > 0 else -step
+                self.moving = True
+            return self.position
+
+    def report(self):
+        with self.lock:
+            return {"position": self.position, "command": self.command,
+                    "source": self.command_source, "frozen": self.frozen,
+                    "moving": self.moving}
+
+    def freeze(self, on):
+        """Stop sending 0x1811, or send it again.
+
+        THE NEGATIVE TEST THIS EXISTS FOR: stop the feedback mid-sweep and
+        the display must draw NO DATA and must NOT complete the step. A sweep
+        that finishes on a dead feedback is the failure step 1 exists to
+        catch.
+        """
+        with self.lock:
+            self.frozen = bool(on)
+
+    def frames(self):
+        """The 0x1811 frame, or nothing while the feedback is frozen."""
+        with self.lock:
+            if self.frozen:
+                return []
+            value = int(round(self.position))
+            value = max(-100, min(100, value))
+        data = bytes([value & 0xFF]) + bytes(7)
+        return [(((TID_RUDDER_FEEDBACK << 8) | RUDDER_FEEDBACK_SOURCE), data,
+                 "rudder feedback %d%%" % value)]
+
+
+def rudder_worker(sock, tx_lock, rudder, stop_event):
+    """Move the modelled ram and report it at 10 Hz.
+
+    The specification gives 0x1811 a 10 Hz rate, and the same period advances
+    the model, so the reported position changes by a believable amount
+    between frames instead of in one jump.
+    """
+    period = 0.1
+    last = time.monotonic()
+    while not stop_event.is_set():
+        now = time.monotonic()
+        dt = now - last
+        last = now
+        rudder.advance(now, dt)
+        for can_id, data, _label in rudder.frames():
+            try:
+                with tx_lock:
+                    send_frame(sock, can_id, data)
+            except OSError:
+                pass
+        stop_event.wait(period)
+
+
 class SystemTestEmulator:
     """The four subsystems of the automatic system test, emulated.
 
@@ -1479,6 +1637,9 @@ def open_monitor_socket(interface):
     watched.append((TID_HEARTBEAT << 8) | ROS_HEARTBEAT_SOURCE)
     watched.append((TID_HEARTBEAT << 8) | BENCH_MAVLINK_SOURCE)
     watched.append((TID_VOLTAGE << 8) | SWITCHING_SOURCE)
+    # THE DISPLAY'S OWN RUDDER COMMAND. can_id = (tid << 8) | source, and the
+    # display is 0x20, so its command is distinguishable from Marvin's 0x01.
+    watched.append((TID_RUDDER_COMMAND << 8) | DISPLAY_SOURCE)
     can_filters = b"".join(
         struct.pack("=II", can_id | CAN_EFF_FLAG, mask)
         for can_id in watched)
@@ -1488,7 +1649,7 @@ def open_monitor_socket(interface):
     return sock
 
 
-def system_test_monitor(sock, state, stop_event):
+def system_test_monitor(sock, state, stop_event, rudder=None):
     """Feed the node's system test from the frames actually on the bus.
 
     It notes evidence whether or not a test is running. `SpecterSystemTest`
@@ -1511,6 +1672,12 @@ def system_test_monitor(sock, state, stop_event):
         tid = (can_id_clean >> 8) & 0xFFFF
         source = can_id_clean & 0xFF
         now = time.monotonic()
+
+        if tid == TID_RUDDER_COMMAND:
+            # spec byte 1 is data[0]. One signed byte, 1 percent per bit.
+            if rudder is not None and dlc >= 1:
+                rudder.note_command(payload[0], source, now)
+            continue
 
         if tid == TID_HEARTBEAT:
             if source == BENCH_MAVLINK_SOURCE:
@@ -1965,6 +2132,39 @@ def handle_command(state, stop_event, line):
             say("Use: session begin, or session end.")
         return
 
+    if head == "rudder":
+        want = parts[1].lower() if len(parts) > 1 else "show"
+        if want == "freeze":
+            # THE NEGATIVE TEST. Stop 0x1811 and the display must draw NO
+            # DATA and must NOT complete step 1. A sweep that finishes on a
+            # dead feedback is the failure that step exists to catch.
+            RUDDER.freeze(True)
+            say("Rudder feedback 0x1811 STOPPED. The ram still moves; "
+                "nothing reports where it is.")
+        elif want in ("thaw", "restore"):
+            RUDDER.freeze(False)
+            say("Rudder feedback 0x1811 is sent again.")
+        elif want == "centre" or want == "center":
+            with RUDDER.lock:
+                RUDDER.position = 0.0
+                RUDDER.command = None
+            say("Rudder placed at centre. Nothing is commanded.")
+        else:
+            r = RUDDER.report()
+            say("\n".join([
+                "-" * 66,
+                "The modelled rudder. It moves at %.0f%% of travel per second."
+                % RUDDER_RATE_PERCENT_PER_S,
+                "  measured 0x1811 : %+.1f %%%s"
+                % (r["position"], "   NOT SENT, frozen" if r["frozen"] else ""),
+                "  command  0x0402 : %s%s"
+                % ("none" if r["command"] is None else "%+d %%" % r["command"],
+                   "" if r["source"] is None
+                   else "   from source 0x%02X" % r["source"]),
+                "  moving          : %s" % r["moving"],
+            ]))
+        return
+
     if head == "checks":
         # WHAT THE NODE MEASURED, from the frames on the WIRE.
         now = time.monotonic()
@@ -2218,8 +2418,9 @@ def main():
         "drop_status_after": args.drop_status_after,
     }
 
-    global TELEMETRY, SYSTEM_TEST
+    global TELEMETRY, SYSTEM_TEST, RUDDER
     SYSTEM_TEST = SystemTestEmulator()
+    RUDDER = RudderModel()
     TELEMETRY = TelemetryState(fuel_percent=args.fuel,
                                volts=args.volts,
                                wiggle=not args.no_wiggle)
@@ -2284,8 +2485,12 @@ def main():
     monitor_sock = open_monitor_socket(args.interface)
     monitor_thread = threading.Thread(
         target=system_test_monitor,
-        args=(monitor_sock, state, stop_event),
+        args=(monitor_sock, state, stop_event, RUDDER),
         name="system-test-monitor", daemon=True)
+    rudder_thread = threading.Thread(
+        target=rudder_worker,
+        args=(tx_sock, tx_lock, RUDDER, stop_event),
+        name="rudder", daemon=True)
 
     rx_thread.start()
     tx_thread.start()
@@ -2293,6 +2498,7 @@ def main():
         telemetry_thread.start()
     system_test_thread.start()
     monitor_thread.start()
+    rudder_thread.start()
 
     if args.duration > 0:
         def stop_later():
