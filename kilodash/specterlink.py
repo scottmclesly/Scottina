@@ -300,6 +300,14 @@ PENDING, ACTIVE, GOOD, FAULT = 0, 1, 2, 3
 STATE_NAMES = {PENDING: "PENDING", ACTIVE: "ACTIVE", GOOD: "GOOD",
                FAULT: "FAULT"}
 STATE_INITIALS = {PENDING: "P", ACTIVE: "A", GOOD: "G", FAULT: "F"}
+
+#: THE AUTOMATIC SYSTEM TEST, packed slots 14 to 17. NOT checklist steps.
+#:
+#: Slot 13 set the precedent: a slot that is never walked, never started and
+#: never confirmed. The checklist is still 13 steps, 0 to 12.
+SYSTEM_TEST_SLOT_BASE = 14
+SYSCHECK_NAMES = ("TOCAN", "ROS", "MAVLINK", "EGES")
+SYSTEM_TEST_STEP = 0             # the step these four results belong to
 GROUP_LETTERS = ("S", "P", "E1", "C", "T", "E2", "R")
 
 
@@ -389,8 +397,40 @@ def decode_node(data):
         "sequence": None,             # the status frame carries no counter
         "steps": steps[:STEPS_IN_USE],
         "shore_link": steps[SHORE_LINK_SLOT],
+        # THE FOUR AUTOMATIC SYSTEM TEST RESULTS. They were unpacked and then
+        # thrown away, so the one screen a person watches while debugging the
+        # system test showed nothing about it at all.
+        "system_test": steps[SYSTEM_TEST_SLOT_BASE:SYSTEM_TEST_SLOT_BASE + 4],
         "states": roll_up(steps),
     }
+
+
+def syscheck_fault(system_test):
+    """Name the FIRST failing subsystem, or None when none has failed.
+
+    First in slot order, so the panel names the same one every time.
+
+    IT DOES NOT BUILD THE OPERATOR LINE. The words the display shows live in
+    the firmware, in `specter_system_test.c`, because no string crosses the
+    bus. A second copy of them here would drift from the glass, and the whole
+    point of this panel is to say what the DISPLAY is being told.
+    """
+    for index, value in enumerate(system_test or ()):
+        if value == FAULT:
+            return SYSCHECK_NAMES[index]
+    return None
+
+
+def syscheck_reported(system_test):
+    """True when every check has reported, pass or fail.
+
+    A check still PENDING is not a pass. This is the same rule the node and
+    the firmware both obey, and it is the reason the panel must never read
+    "ready" off an absence.
+    """
+    if not system_test:
+        return False
+    return all(value != PENDING for value in system_test)
 
 
 DECODERS = {

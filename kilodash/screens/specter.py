@@ -250,11 +250,55 @@ class SpecterScreen(Screen):
                 rows.append({"label": "NODE", "value": "waiting for operator",
                              "state": "caution"})
 
-            # ---- all 13 steps, by name ----
-            for index, value in enumerate(nf.get("steps", [])):
+            # ---- THE AUTOMATIC SYSTEM TEST, slots 14 to 17 ----
+            #
+            # It goes ABOVE the step list, because while step 0 runs it is
+            # the only thing moving and it was not on this panel at all. A
+            # running test and a finished one looked identical, so there was
+            # nothing to watch while debugging one.
+            system_test = nf.get("system_test") or []
+            if system_test:
+                fault = SL.syscheck_fault(system_test)
                 rows.append({
-                    "label": "%2d %s" % (index, SL.step_name(index)),
-                    "value": SL.STATE_NAMES[value],
+                    "label": "SYSTEM TEST",
+                    "value": "  ".join(
+                        "%s:%s" % (name, SL.STATE_INITIALS[value])
+                        for name, value
+                        in zip(SL.SYSCHECK_NAMES, system_test)),
+                    "state": ("fault" if fault
+                              else "ok" if all(v == SL.GOOD
+                                               for v in system_test)
+                              else "caution"),
+                })
+                if fault:
+                    rows.append({
+                        "label": "  FAILED",
+                        "value": "%s did not answer" % fault,
+                        "state": "fault",
+                    })
+                elif not SL.syscheck_reported(system_test):
+                    rows.append({
+                        "label": "  WAITING",
+                        "value": "%d of %d checks have reported"
+                                 % (sum(1 for v in system_test
+                                        if v != SL.PENDING), len(system_test)),
+                        "state": "caution",
+                    })
+
+            # ---- all 13 steps, by name ----
+            #
+            # THE CURRENT STEP IS MARKED. A step list where only the colour
+            # said which one was running is a list nobody can read at a
+            # glance, and colour is the first thing a photograph of a bench
+            # screen loses.
+            for index, value in enumerate(nf.get("steps", [])):
+                current = (value == SL.ACTIVE)
+                rows.append({
+                    "label": "%s%2d %s" % (">> " if current else "   ",
+                                           index, SL.step_name(index)),
+                    "value": ("%s   <- the operator is here"
+                              % SL.STATE_NAMES[value] if current
+                              else SL.STATE_NAMES[value]),
                     "state": ("ok" if value == SL.GOOD
                               else "fault" if value == SL.FAULT
                               else "caution" if value == SL.ACTIVE else None),
@@ -410,12 +454,27 @@ class SpecterScreen(Screen):
                         fill=c)
 
     def _steps_strip(self, d, th, y):
-        """All 13 steps as one strip: colour is state, number is the step.
+        """All 13 steps as one strip, then the step the operator is on.
 
-        Thirteen cells across 480 pixels is 33 each, so the cell carries the
-        step NUMBER and the state colour. The name of the step under the
-        cursor is written under the strip, because a number alone means
-        nothing across a bench.
+        Thirteen cells across the width is about 22 each, so the cell carries
+        the step NUMBER and the state.
+
+        EVERY STATE HAS A SHAPE, NOT ONLY A COLOUR. A running test and a
+        finished one were an amber cell and a green cell and nothing else,
+        which is the pair a bench photograph loses first and the pair that
+        matters most while debugging. So:
+
+            PENDING   outline only, muted number
+            ACTIVE    filled, and a POINTER above the cell
+            GOOD      filled, and an underline inside the cell
+            FAULT     filled, and a CROSS through the cell
+
+        Two of the four now read with no colour at all, and the pointer says
+        which step is current from across the bench.
+
+        THE CAPTION UNDER THE STRIP WAS PROMISED AND NEVER WRITTEN. This
+        docstring used to claim the name of the current step was written
+        below, and no line of code did it, so a number was all anybody got.
         """
         w = self.app.w
         _disp, node = self._snap
@@ -424,11 +483,13 @@ class SpecterScreen(Screen):
         n = SL.STEPS_IN_USE
         gap = 2
         cw = (w - 28 - gap * (n - 1)) / n
-        h = 26
+        point = 7          # the pointer band above the cells
+        h = 22
+        top = y + point
 
         for i in range(n):
             x0 = 14 + i * (cw + gap)
-            box = (x0, y, x0 + cw, y + h)
+            box = (x0, top, x0 + cw, top + h)
             value = steps[i] if i < len(steps) else None
             if value is None:
                 d.rectangle(box, outline=th.card_hi, width=1)
@@ -443,7 +504,110 @@ class SpecterScreen(Screen):
             f = T.font(11, bold=True, mono=True)
             label = "%d" % i
             lw_ = d.textlength(label, font=f)
-            d.text((x0 + cw / 2 - lw_ / 2, y + 6), label, font=f, fill=tc)
+            d.text((x0 + cw / 2 - lw_ / 2, top + 4), label, font=f, fill=tc)
+
+            cx = x0 + cw / 2
+            if value == SL.ACTIVE:
+                # THE POINTER. It is the answer to "which step is current",
+                # and it needs no colour to be read.
+                d.polygon([(cx - 4, y), (cx + 4, y), (cx, y + point - 1)],
+                          fill=col)
+                d.rectangle(box, outline=th.fg, width=1)
+            elif value == SL.GOOD:
+                d.rectangle((x0 + 4, top + h - 6, x0 + cw - 4, top + h - 4),
+                            fill=tc)
+            elif value == SL.FAULT:
+                d.line((x0 + 3, top + 3, x0 + cw - 3, top + h - 3),
+                       fill=tc, width=2)
+                d.line((x0 + 3, top + h - 3, x0 + cw - 3, top + 3),
+                       fill=tc, width=2)
+
+        y = top + h + 3
+
+        # ---- the step the operator is on, in words ----
+        f = T.font(T.HINT, mono=True)
+        active = [i for i, v in enumerate(steps) if v == SL.ACTIVE]
+        if active:
+            # THE MARKER MUST SURVIVE A LONG STEP NAME. "seakeeper ride trim"
+            # ran the line past the panel and cut the words that said the
+            # node was waiting, which is the half that changes.
+            tail = "  WAITING" if nf.get("operator_input_requested") else ""
+            room = 52 - len(tail) - 6
+            caption = "NOW  %d %s%s" % (active[0],
+                                        SL.step_name(active[0])[:room], tail)
+            colour = th.warn
+        elif steps and all(v == SL.GOOD for v in steps):
+            caption, colour = "NOW  every step GOOD", th.ok
+        elif not steps:
+            caption, colour = "NOW  no status frame", th.muted
+        else:
+            caption, colour = "NOW  no step is ACTIVE", th.muted
+        d.text((14, y), caption[:52], font=f, fill=colour)
+        return y + 12
+
+    def _system_test_strip(self, d, th, y):
+        """The four automatic system test results, packed slots 14 to 17.
+
+        THEY WERE NOWHERE ON THIS PANEL. Step 0 is the automatic system test,
+        and while it runs those four slots are the only thing moving on the
+        whole bus. With nothing here, a test that had finished and a test
+        that had never started looked the same, so there was nothing to watch
+        while debugging one.
+
+        THE WORDS ON THE GLASS ARE NOT REBUILT HERE. The display holds the
+        operator line, in `specter_system_test.c`, because no string crosses
+        the bus. This panel says what the node MEASURED. A second copy of the
+        words would drift from the glass, and the point of this panel is to
+        show what the display is being told.
+        """
+        w = self.app.w
+        _disp, node = self._snap
+        nf = node.get("fields") or {}
+        checks = nf.get("system_test") or []
+        if not checks:
+            return y
+        steps = nf.get("steps") or []
+        running = (steps[SL.SYSTEM_TEST_STEP] == SL.ACTIVE
+                   if len(steps) > SL.SYSTEM_TEST_STEP else False)
+        if not running and all(v == SL.PENDING for v in checks):
+            # Not running and nothing measured. Drawing four empty boxes
+            # would take the room the rest of the panel needs to say
+            # something true.
+            return y
+
+        n = len(checks)
+        gap = 3
+        cw = (w - 28 - gap * (n - 1)) / n
+        h = 20
+        f = T.font(9, bold=True, mono=True)
+        for i, value in enumerate(checks):
+            x0 = 14 + i * (cw + gap)
+            box = (x0, y, x0 + cw, y + h)
+            col = self._state_colour(th, value)
+            if value == SL.PENDING:
+                d.rectangle(box, outline=col, width=1)
+                tc = th.muted
+            else:
+                d.rectangle(box, fill=col)
+                tc = th.ink
+            label = SL.SYSCHECK_NAMES[i]
+            lw_ = d.textlength(label, font=f)
+            while lw_ > cw - 4 and len(label) > 3:
+                label = label[:-1]
+                lw_ = d.textlength(label, font=f)
+            d.text((x0 + cw / 2 - lw_ / 2, y + 2), label, font=f, fill=tc)
+            # THE MARK GOES UNDER THE NAME, NEVER THROUGH IT. A cross drawn
+            # across the cell struck out the one word the operator needs to
+            # read, so the cell that mattered most was the only unreadable
+            # one on the panel.
+            band = y + h - 5
+            if value == SL.GOOD:
+                d.rectangle((x0 + 5, band, x0 + cw - 5, band + 2), fill=tc)
+            elif value == SL.FAULT:
+                d.line((x0 + cw / 2 - 4, band - 1, x0 + cw / 2 + 4, band + 3),
+                       fill=tc, width=2)
+                d.line((x0 + cw / 2 - 4, band + 3, x0 + cw / 2 + 4, band - 1),
+                       fill=tc, width=2)
         return y + h
 
     def _veto(self, d, th, y):
@@ -575,10 +739,21 @@ class SpecterScreen(Screen):
 
         # ---- the SPECTER state: the strip, then the words ----
         y = self._steps_strip(d, th, y)
+        y += 4
+        y = self._system_test_strip(d, th, y)
         y += 6
         y = self._veto(d, th, y)
         y += 6
-        y = self._specter_lines(d, th, y, floor=h - BTN_H - 16)
+        # THE FLOOR RESERVES THE BUS CARD, NOT ONLY THE BUTTON.
+        #
+        # This floor used to be the top of the button. The bus card is drawn
+        # AFTER these lines, so the shed-by-priority rule protected the
+        # button and nothing else: the first block above that grew pushed the
+        # card down over the reader line and off the panel. The card is 58
+        # tall with 8 above it, and it is the line that says whether the bus
+        # is alive at all, so it outranks STATE, EVENT and BUILD.
+        y = self._specter_lines(d, th, y,
+                                floor=h - BTN_H - 16 - (58 + 8) - 14)
         y += 4
 
         # ---- bus card ----
@@ -610,8 +785,18 @@ class SpecterScreen(Screen):
         self._draw_node_button(d, th, btn_top)
 
         # ---- legend + reader health ----
+        #
+        # THE READER MESSAGE OWNS THE LINE ABOVE THE BUTTON. The legend used
+        # to test only the button top, so when the panel filled up the two
+        # were written at the same y and neither could be read. The legend is
+        # the one that goes: it explains four colours, and the other line
+        # says the bus reader is dead.
         y += 8
-        if y + 12 < btn_top:
+        reader_msg = (self.reader.error if self.reader
+                      else "no reader — %s is down" % IFACE) \
+            if (self.reader is None or self.reader.error) else None
+        legend_floor = btn_top - (16 if reader_msg else 0)
+        if y + 12 < legend_floor:
             keys = ((SL.GOOD, "GOOD"), (SL.ACTIVE, "ACTIVE"),
                     (SL.FAULT, "FAULT"), (SL.PENDING, "PENDING"))
             x = 14
@@ -626,10 +811,8 @@ class SpecterScreen(Screen):
                 d.text((x + 12, y + 1), name, font=lf, fill=th.muted)
                 x += 14 + d.textlength(name, font=lf) + 10
 
-        err = self.reader.error if self.reader else None
-        if err or self.reader is None:
-            msg = err or "no reader — %s is down" % IFACE
-            d.text((14, btn_top - 14), msg[:46],
+        if reader_msg:
+            d.text((14, btn_top - 14), reader_msg[:46],
                    font=T.font(T.HINT, mono=True), fill=th.warn)
 
     def _draw_node_button(self, d, th, y):

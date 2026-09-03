@@ -668,6 +668,125 @@ def row(rows, label):
     return None
 
 
+def node_frame_slots(flags, slots):
+    """A status frame with any of the 24 packed slots set."""
+    data = bytearray(8)
+    data[0] = flags
+    for n, value in enumerate(slots):
+        data[1 + (n >> 2)] |= (value & 3) << ((n & 3) * 2)
+    return bytes(data)
+
+
+class TestTheSystemTestSlotsAreDecoded(unittest.TestCase):
+    """Slots 14 to 17 carry the automatic system test. They were thrown away.
+
+    `decode_node` unpacked all 24 slots and kept 13 steps and slot 13, so the
+    four results the whole of step 0 produces reached nothing. The one screen
+    a person watches while debugging the system test showed nothing about it.
+    """
+
+    def test_the_four_results_survive_the_decode(self):
+        slots = [SL.PENDING] * 24
+        slots[14] = SL.GOOD
+        slots[15] = SL.GOOD
+        slots[16] = SL.FAULT
+        slots[17] = SL.GOOD
+        fields = SL.decode_node(node_frame_slots(0x03, slots))
+        self.assertEqual(fields["system_test"],
+                         [SL.GOOD, SL.GOOD, SL.FAULT, SL.GOOD])
+
+    def test_the_checklist_is_still_thirteen_steps(self):
+        slots = [SL.GOOD] * 24
+        fields = SL.decode_node(node_frame_slots(0x00, slots))
+        self.assertEqual(len(fields["steps"]), 13,
+                         "slots 14 to 17 are NOT checklist steps")
+
+    def test_the_first_fault_is_named(self):
+        self.assertEqual(
+            SL.syscheck_fault([SL.GOOD, SL.FAULT, SL.FAULT, SL.GOOD]), "ROS",
+            "first in slot order, so the panel names the same one every time")
+        self.assertIsNone(SL.syscheck_fault([SL.GOOD] * 4))
+        self.assertIsNone(SL.syscheck_fault([]))
+
+    def test_a_pending_check_is_not_a_report(self):
+        """A check still PENDING is not a pass. It is the whole rule."""
+        self.assertFalse(SL.syscheck_reported([SL.GOOD, SL.GOOD,
+                                               SL.PENDING, SL.GOOD]))
+        self.assertTrue(SL.syscheck_reported([SL.GOOD, SL.GOOD,
+                                              SL.FAULT, SL.GOOD]))
+        self.assertFalse(SL.syscheck_reported([]))
+
+    def test_the_panel_never_reads_ready_over_a_silent_subsystem(self):
+        slots = [SL.PENDING] * 24
+        slots[0] = SL.ACTIVE
+        slots[14] = SL.GOOD
+        slots[15] = SL.GOOD
+        slots[16] = SL.FAULT
+        slots[17] = SL.GOOD
+        rows = panel(display_frame(),
+                     node_frame_slots(0x03, slots)).specter_rows()
+        summary = row(rows, "SYSTEM TEST")
+        self.assertIsNotNone(summary, "the four results reach the panel")
+        self.assertEqual(summary["state"], "fault")
+        failed = row(rows, "  FAILED")
+        self.assertIsNotNone(failed)
+        self.assertIn("MAVLINK", failed["value"])
+
+    def test_a_test_still_running_says_so(self):
+        slots = [SL.PENDING] * 24
+        slots[0] = SL.ACTIVE
+        slots[14] = SL.GOOD
+        rows = panel(display_frame(),
+                     node_frame_slots(0x01, slots)).specter_rows()
+        waiting = row(rows, "  WAITING")
+        self.assertIsNotNone(waiting, "an unfinished test must not look done")
+        self.assertIn("1 of 4", waiting["value"])
+        self.assertEqual(row(rows, "SYSTEM TEST")["state"], "caution")
+
+    def test_nothing_is_drawn_before_the_test_starts(self):
+        slots = [SL.PENDING] * 24
+        rows = panel(display_frame(),
+                     node_frame_slots(0x01, slots)).specter_rows()
+        self.assertEqual(row(rows, "SYSTEM TEST")["state"], "caution",
+                         "all four PENDING is a caution, never an ok")
+
+
+class TestTheCurrentStepIsMarked(unittest.TestCase):
+    """A step list where only the COLOUR says which one is running.
+
+    Colour is the first thing a photograph of a bench screen loses, and it is
+    the pair GOOD and ACTIVE that a debugger needs most.
+    """
+
+    def test_the_active_step_carries_a_marker(self):
+        slots = [SL.GOOD, SL.ACTIVE] + [SL.PENDING] * 22
+        rows = panel(display_frame(),
+                     node_frame_slots(0x03, slots)).specter_rows()
+        labels = [entry["label"] for entry in rows]
+        active = [text for text in labels if text.startswith(">>")]
+        self.assertEqual(len(active), 1, "exactly one step is marked current")
+        self.assertIn("1", active[0])
+        done = [text for text in labels
+                if text.strip().startswith("0 ")]
+        self.assertTrue(done and not done[0].startswith(">>"),
+                        "a finished step is NOT marked current")
+
+    def test_the_marker_says_where_the_operator_is(self):
+        slots = [SL.GOOD, SL.ACTIVE] + [SL.PENDING] * 22
+        rows = panel(display_frame(),
+                     node_frame_slots(0x03, slots)).specter_rows()
+        current = [e for e in rows if e["label"].startswith(">>")][0]
+        self.assertIn("the operator is here", current["value"])
+        self.assertEqual(current["state"], "caution")
+
+    def test_no_step_active_marks_nothing(self):
+        slots = [SL.GOOD] * 13 + [SL.PENDING] * 11
+        rows = panel(display_frame(),
+                     node_frame_slots(0x00, slots)).specter_rows()
+        self.assertFalse([e for e in rows if e["label"].startswith(">>")],
+                         "a finished checklist marks no current step")
+
+
 class TestTheBuildLineReachesThePanel(unittest.TestCase):
     """A blocked display sends no handshake request. It still has an image.
 
