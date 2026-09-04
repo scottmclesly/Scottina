@@ -2144,6 +2144,27 @@ def handle_command(state, stop_event, line):
         elif want in ("thaw", "restore"):
             RUDDER.freeze(False)
             say("Rudder feedback 0x1811 is sent again.")
+        elif want in ("set", "port", "starboard", "stbd"):
+            # PLACE THE RAM. It is a bench control, not a command: it moves
+            # the modelled position without anyone commanding 0x0402, so the
+            # display can be shown a reading it would otherwise only reach
+            # through a sweep that stops at its own tolerance.
+            if want == "port":
+                value = -100.0
+            elif want in ("starboard", "stbd"):
+                value = 100.0
+            else:
+                try:
+                    value = float(parts[2])
+                except (IndexError, ValueError):
+                    say("Use: rudder set <-100 to 100>, or rudder port, "
+                        "or rudder starboard.")
+                    return
+            value = max(-100.0, min(100.0, value))
+            with RUDDER.lock:
+                RUDDER.position = value
+                RUDDER.command = None
+            say("Rudder placed at %+.0f %%. Nothing is commanded." % value)
         elif want == "centre" or want == "center":
             with RUDDER.lock:
                 RUDDER.position = 0.0
