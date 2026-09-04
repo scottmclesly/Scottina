@@ -336,6 +336,43 @@ RUDDER_NO_COMMAND = 0xFF
 #: does when nobody is commanding it any more, which is stop.
 RUDDER_COMMAND_HOLD_S = 0.5
 
+#: `0x0404 Linear Actuator Control`, from the DISPLAY at source 0x20.
+#: spec byte 1 is the ACTUATOR ADDRESS, spec byte 2 the percentage extension.
+TID_ACTUATOR_COMMAND = 0x0404
+
+#: `0x1812 Linear Actuator Feedback`. The MEASURED position, 1 Hz.
+TID_ACTUATOR_FEEDBACK = 0x1812
+
+#: THE ACTUATOR ADDRESSES ARE THEIR OWN SPACE, 0x00 to 0xFF. They are PAYLOAD
+#: values, not CAN source addresses. 0x21 is the port hatch and 0x22 the
+#: starboard, both Electrak MD Thomson units. The node source address is also
+#: 0x21 and there is NO COLLISION: one is a byte inside a message and the
+#: other is part of an identifier.
+ACTUATOR_PORT = 0x21
+ACTUATOR_STBD = 0x22
+ACTUATOR_IDS = (ACTUATOR_PORT, ACTUATOR_STBD)
+ACTUATOR_NAMES = {ACTUATOR_PORT: "port", ACTUATOR_STBD: "starboard"}
+
+#: The rig answers as a ToCAN device, the same source as the other measured
+#: values.
+ACTUATOR_FEEDBACK_SOURCE = 0x81
+
+#: How fast a hatch screw travels, in percent of full extension per second.
+#:
+#: A HATCH MUST TAKE REAL TIME. Closed to open is 100 percent, so at 20
+#: percent per second it takes five seconds and the full open-then-close
+#: cycle about ten. A rig that jumped the feedback to the commanded value
+#: would let the display finish a cycle in one slice, and every rule about
+#: watching the metal move would be untested.
+ACTUATOR_RATE_PERCENT_PER_S = 20.0
+
+#: How long a command stands before the screw stops. The display sends at
+#: 1 Hz, so two and a half seconds is two missed frames.
+#:
+#: IT IS A HOLD, NOT A TIMEOUT ON THE CYCLE. The DISPLAY decides when its
+#: cycle is finished, from this feedback.
+ACTUATOR_COMMAND_HOLD_S = 2.5
+
 # THE ECHO FOLLOWS ITS COMMAND. It is not a second wiggle.
 #
 # Each value here takes the value of the tid it maps to, so 0x0500 always
@@ -515,6 +552,7 @@ TELEMETRY = None
 #: it by name so `silence` and `restore` can switch one off and on.
 SYSTEM_TEST = None
 RUDDER = None
+ACTUATORS = None
 
 
 def say(text):
@@ -1337,6 +1375,132 @@ class TelemetryState:
             return self.values.get((tid, field), 0.0)
 
 
+class ActuatorModel:
+    """Two payload hatch screws that take real time to move.
+
+    IT IS TWO INDEPENDENT DEVICES. Each has its own position, its own
+    standing command and its own freeze, because the step exists to catch ONE
+    of them failing and a shared model could not show that.
+
+    IT DOES NOT KNOW WHAT A CYCLE IS, and it must not: the cycle lives in the
+    display, and a rig that understood it would be a second implementation of
+    the thing under test.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.position = {a: 0.0 for a in ACTUATOR_IDS}
+        self.command = {a: None for a in ACTUATOR_IDS}
+        self.command_at = {a: None for a in ACTUATOR_IDS}
+        self.frozen = {a: False for a in ACTUATOR_IDS}
+        self.moving = {a: False for a in ACTUATOR_IDS}
+
+    def note_command(self, actuator, percent, now):
+        """One 0x0404 arrived. `percent` is the raw byte."""
+        with self.lock:
+            if actuator not in self.position:
+                # AN ADDRESS THIS RIG DOES NOT KNOW IS DROPPED, not stored.
+                # A third hatch nobody has told the bench about must not
+                # drive a gauge drawn for two.
+                return
+            if not 0 <= percent <= 100:
+                # The specification carries no encoding above 100. The rig
+                # REFUSES it rather than clamping: a clamp would let a wrong
+                # command look like a good one.
+                return
+            self.command[actuator] = int(percent)
+            self.command_at[actuator] = now
+
+    def advance(self, now, dt):
+        with self.lock:
+            for a in ACTUATOR_IDS:
+                target = self.command[a]
+                at = self.command_at[a]
+                if (target is not None and at is not None
+                        and (now - at) > ACTUATOR_COMMAND_HOLD_S):
+                    # NOBODY IS COMMANDING ANY MORE. The screw stops where it
+                    # is. It does NOT spring back to closed.
+                    target = None
+                    self.command[a] = None
+                if target is None:
+                    self.moving[a] = False
+                    continue
+                step = ACTUATOR_RATE_PERCENT_PER_S * dt
+                gap = target - self.position[a]
+                if abs(gap) <= step:
+                    self.position[a] = float(target)
+                    self.moving[a] = False
+                else:
+                    self.position[a] += step if gap > 0 else -step
+                    self.moving[a] = True
+
+    def place(self, actuator, percent):
+        with self.lock:
+            if actuator in self.position:
+                self.position[actuator] = max(0.0, min(100.0, float(percent)))
+                self.command[actuator] = None
+
+    def freeze(self, actuator, on):
+        """Stop sending 0x1812 for ONE hatch, or send it again.
+
+        THE NEGATIVE TEST THIS EXISTS FOR: freeze one hatch mid-travel and
+        the display must draw NO DATA for it, must not complete the step, and
+        must not let the operator walk away from it.
+        """
+        with self.lock:
+            if actuator in self.frozen:
+                self.frozen[actuator] = bool(on)
+
+    def report(self):
+        with self.lock:
+            return {a: {"position": self.position[a],
+                        "command": self.command[a],
+                        "frozen": self.frozen[a],
+                        "moving": self.moving[a]} for a in ACTUATOR_IDS}
+
+    def frames(self):
+        """One 0x1812 per hatch, skipping any that is frozen."""
+        out = []
+        with self.lock:
+            for a in ACTUATOR_IDS:
+                if self.frozen[a]:
+                    continue
+                value = int(round(self.position[a]))
+                value = max(0, min(100, value))
+                data = bytes([a & 0xFF, value & 0xFF]) + bytes(6)
+                out.append((((TID_ACTUATOR_FEEDBACK << 8)
+                             | ACTUATOR_FEEDBACK_SOURCE), data,
+                            "%s hatch %d%%" % (ACTUATOR_NAMES[a], value)))
+        return out
+
+
+def actuator_worker(sock, tx_lock, model, stop_event):
+    """Move the modelled screws and report them at 1 Hz.
+
+    The specification gives 0x1812 a 1 Hz rate. The model is advanced far
+    more often than that, so the reported position is where the screw
+    actually is at the moment the frame goes out rather than one second
+    behind it.
+    """
+    tick = 0.1
+    period = 1.0
+    last = time.monotonic()
+    due = last
+    while not stop_event.is_set():
+        now = time.monotonic()
+        model.advance(now, now - last)
+        last = now
+        if now >= due:
+            due = now + period
+            for can_id, data, _label in model.frames():
+                try:
+                    with tx_lock:
+                        send_frame(sock, can_id, data)
+                except OSError:
+                    pass
+        stop_event.wait(tick)
+
+
 class RudderModel:
     """A rudder that takes real time to move, and reports where it IS.
 
@@ -1640,6 +1804,7 @@ def open_monitor_socket(interface):
     # THE DISPLAY'S OWN RUDDER COMMAND. can_id = (tid << 8) | source, and the
     # display is 0x20, so its command is distinguishable from Marvin's 0x01.
     watched.append((TID_RUDDER_COMMAND << 8) | DISPLAY_SOURCE)
+    watched.append((TID_ACTUATOR_COMMAND << 8) | DISPLAY_SOURCE)
     can_filters = b"".join(
         struct.pack("=II", can_id | CAN_EFF_FLAG, mask)
         for can_id in watched)
@@ -1649,7 +1814,8 @@ def open_monitor_socket(interface):
     return sock
 
 
-def system_test_monitor(sock, state, stop_event, rudder=None):
+def system_test_monitor(sock, state, stop_event, rudder=None,
+                        actuators=None):
     """Feed the node's system test from the frames actually on the bus.
 
     It notes evidence whether or not a test is running. `SpecterSystemTest`
@@ -1672,6 +1838,12 @@ def system_test_monitor(sock, state, stop_event, rudder=None):
         tid = (can_id_clean >> 8) & 0xFFFF
         source = can_id_clean & 0xFF
         now = time.monotonic()
+
+        if tid == TID_ACTUATOR_COMMAND:
+            # spec byte 1 is the actuator address, spec byte 2 the extension.
+            if actuators is not None and dlc >= 2:
+                actuators.note_command(payload[0], payload[1], now)
+            continue
 
         if tid == TID_RUDDER_COMMAND:
             # spec byte 1 is data[0]. One signed byte, 1 percent per bit.
@@ -2132,6 +2304,58 @@ def handle_command(state, stop_event, line):
             say("Use: session begin, or session end.")
         return
 
+    if head == "hatch":
+        want = parts[1].lower() if len(parts) > 1 else "show"
+        which = {"port": [ACTUATOR_PORT], "stbd": [ACTUATOR_STBD],
+                 "starboard": [ACTUATOR_STBD],
+                 "both": list(ACTUATOR_IDS)}.get(
+                     parts[2].lower() if len(parts) > 2 else "both",
+                     list(ACTUATOR_IDS))
+        if want == "freeze":
+            for a in which:
+                ACTUATORS.freeze(a, True)
+            say("0x1812 STOPPED for %s. The screw still moves; nothing "
+                "reports where it is."
+                % ", ".join(ACTUATOR_NAMES[a] for a in which))
+        elif want in ("thaw", "restore"):
+            for a in which:
+                ACTUATORS.freeze(a, False)
+            say("0x1812 is sent again for %s."
+                % ", ".join(ACTUATOR_NAMES[a] for a in which))
+        elif want in ("set", "open", "close", "closed"):
+            if want == "open":
+                value = 100.0
+            elif want in ("close", "closed"):
+                value = 0.0
+            else:
+                try:
+                    value = float(parts[2])
+                    which = list(ACTUATOR_IDS)
+                except (IndexError, ValueError):
+                    say("Use: hatch set <0 to 100>, or hatch open, "
+                        "or hatch close.")
+                    return
+            for a in which:
+                ACTUATORS.place(a, value)
+            say("Placed %s at %.0f %%. Nothing is commanded."
+                % (", ".join(ACTUATOR_NAMES[a] for a in which), value))
+        else:
+            report = ACTUATORS.report()
+            lines = ["-" * 66,
+                     "The two payload hatch screws. %.0f%% of travel per "
+                     "second." % ACTUATOR_RATE_PERCENT_PER_S]
+            for a in ACTUATOR_IDS:
+                r = report[a]
+                lines.append(
+                    "  0x%02X %-9s measured %5.1f %%%s   command %s   "
+                    "moving %s"
+                    % (a, ACTUATOR_NAMES[a], r["position"],
+                       "  NOT SENT" if r["frozen"] else "",
+                       "none" if r["command"] is None
+                       else "%d %%" % r["command"], r["moving"]))
+            say("\n".join(lines))
+        return
+
     if head == "rudder":
         want = parts[1].lower() if len(parts) > 1 else "show"
         if want == "freeze":
@@ -2439,9 +2663,10 @@ def main():
         "drop_status_after": args.drop_status_after,
     }
 
-    global TELEMETRY, SYSTEM_TEST, RUDDER
+    global TELEMETRY, SYSTEM_TEST, RUDDER, ACTUATORS
     SYSTEM_TEST = SystemTestEmulator()
     RUDDER = RudderModel()
+    ACTUATORS = ActuatorModel()
     TELEMETRY = TelemetryState(fuel_percent=args.fuel,
                                volts=args.volts,
                                wiggle=not args.no_wiggle)
@@ -2506,12 +2731,16 @@ def main():
     monitor_sock = open_monitor_socket(args.interface)
     monitor_thread = threading.Thread(
         target=system_test_monitor,
-        args=(monitor_sock, state, stop_event, RUDDER),
+        args=(monitor_sock, state, stop_event, RUDDER, ACTUATORS),
         name="system-test-monitor", daemon=True)
     rudder_thread = threading.Thread(
         target=rudder_worker,
         args=(tx_sock, tx_lock, RUDDER, stop_event),
         name="rudder", daemon=True)
+    actuator_thread = threading.Thread(
+        target=actuator_worker,
+        args=(tx_sock, tx_lock, ACTUATORS, stop_event),
+        name="actuators", daemon=True)
 
     rx_thread.start()
     tx_thread.start()
@@ -2520,6 +2749,7 @@ def main():
     system_test_thread.start()
     monitor_thread.start()
     rudder_thread.start()
+    actuator_thread.start()
 
     if args.duration > 0:
         def stop_later():
