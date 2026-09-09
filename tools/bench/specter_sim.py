@@ -361,13 +361,20 @@ TRIM_FEEDBACK_SOURCE = YANMAR_SOURCE
 
 #: How fast the modelled trim ram travels, in degrees per second.
 #:
-#: A FULL SWEEP MUST TAKE REAL TIME. The display's sweep is nominal to full
-#: up, then to full down, then back to nominal, which is about 150 degrees of
-#: travel. At 12 degrees per second that is twelve and a half seconds. A rig
-#: that jumped the feedback to the commanded value would let the display
-#: finish a sweep in one slice, and every rule about watching the metal move
-#: would be untested.
-TRIM_RATE_DEG_PER_S = 12.0
+#: A SWEEP MUST TAKE REAL TIME. The display's sweep is nominal 30 to 40 and
+#: back, which is 20 degrees of travel. At 3 degrees per second that is
+#: about seven seconds, and the operator can watch the number climb and
+#: come back. A rig that jumped the feedback to the commanded value would
+#: let the display finish a sweep in one slice, and every rule about
+#: watching the metal move would be untested.
+#:
+#: IT WAS 12 WHEN THE SWEEP WAS 150 DEGREES OF TRAVEL. The travel became 20
+#: on 2026-09-09, so the same rate finished the whole test in under two
+#: seconds, which is a jump to anyone watching the glass.
+#:
+#: **NOBODY HAS MEASURED THE REAL RAM.** This is a bench rate, chosen so the
+#: sweep is watchable. Correct it at stage 2 against a live drive.
+TRIM_RATE_DEG_PER_S = 3.0
 
 #: How long a command stands before the ram stops. The display sends at
 #: 10 Hz, so half a second is five missed frames.
@@ -379,17 +386,35 @@ TRIM_COMMAND_HOLD_S = 0.5
 
 #: Where the modelled leg can physically go, in degrees.
 #:
-#: THE ENDS ARE THE RIG'S, NOT A DOCUMENT'S. Ben's specification says the
-#: command is in degrees and then says "Each vehicle will have a differing
-#: interpretation of what these degrees mean". It gives no travel and no end
-#: stop, so nothing here is quoted and nothing here is claimed to be
-#: measured. The rig has to stop somewhere, and these are where it stops.
+#: **THIS IS THE TRAVEL SCOTT SPECIFIED, 2026-09-09: -10 AT THE BOTTOM AND
+#: 40 AT THE TOP.** It is the same span the display draws, in
+#: `SPECTER_TRIM_BAR_LOW_DEG` and `SPECTER_TRIM_BAR_HIGH_DEG`, so the rig
+#: models the travel the operator is told to expect and not one of its own.
+#:
+#: IT WAS -15 TO 90, WHICH WAS THE RIG'S OWN INVENTION. Ben's specification
+#: gives no travel and no end stop, so the rig had to stop somewhere and
+#: those were where it stopped. They were never a claim about the vessel,
+#: and the display was drawing a different span from the one the rig moved
+#: in.
+#:
+#: **NOBODY HAS MEASURED THE REAL DRIVE.** Correct these at stage 2, with
+#: the display constants, against a live leg.
 #:
 #: THE LOW END IS BELOW ZERO ON PURPOSE. 0x1801 is SIGNED, so a real drive
 #: can report a negative trim. The rig can be PLACED there by hand, which is
 #: how the bench proves the display DRAWS a reading it can never COMMAND.
-TRIM_MIN_DEG = -15.0
-TRIM_MAX_DEG = 90.0
+TRIM_MIN_DEG = -10.0
+TRIM_MAX_DEG = 40.0
+
+#: Where the leg rests, in degrees. It is the display's `SPECTER_TRIM_NOMINAL`.
+#:
+#: **THE SWEEP STARTS AND ENDS HERE, AND NOTHING GOES BELOW IT.** A leg
+#: driven below 30 degrees out of the water can damage the motor, so the
+#: display commands nothing lower and the rig rests nowhere lower.
+#:
+#: IT WAS 15, WHICH WAS THE OLD NOMINAL. A rig that parked at 15 showed the
+#: leg climbing out of a position the test never uses.
+TRIM_NOMINAL_DEG = 30.0
 
 #: `0x0404 Linear Actuator Control`, from the DISPLAY at source 0x20.
 #: spec byte 1 is the ACTUATOR ADDRESS, spec byte 2 the percentage extension.
@@ -1683,7 +1708,7 @@ class TrimModel:
     second CAN SOURCE and this becomes one model per source.
     """
 
-    def __init__(self, position=15.0):
+    def __init__(self, position=TRIM_NOMINAL_DEG):
         self.lock = threading.Lock()
         self.position = float(position)
         self.command = None          # None means nobody is commanding
@@ -2671,9 +2696,10 @@ def handle_command(state, stop_event, line):
             say("Trim placed at %+.0f degrees. Nothing is commanded." % value)
         elif want in ("centre", "center", "nominal"):
             with TRIM.lock:
-                TRIM.position = 15.0
+                TRIM.position = TRIM_NOMINAL_DEG
                 TRIM.command = None
-            say("Trim placed at nominal, 15 degrees. Nothing is commanded.")
+            say("Trim placed at nominal, %.0f degrees. Nothing is commanded."
+                % TRIM_NOMINAL_DEG)
         else:
             r = TRIM.report()
             say("\n".join([
