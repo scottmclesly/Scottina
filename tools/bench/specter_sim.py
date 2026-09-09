@@ -336,6 +336,61 @@ RUDDER_NO_COMMAND = 0xFF
 #: does when nobody is commanding it any more, which is stop.
 RUDDER_COMMAND_HOLD_S = 0.5
 
+#: `0x0403 Trim/Tilt Angle Command`, from the DISPLAY at source 0x20.
+#:
+#: THE DISPLAY COMMANDS THE ENGINE TRIM, the same rule that gave it the
+#: rudder: Ben's specification defines a command for the device, so the
+#: display sends it. Marvin may command trim from 0x01 as well, so this rig
+#: obeys whichever it saw last and says which one it was, exactly as it does
+#: for the rudder.
+#:
+#: spec byte 1 is the angle, ONE UNSIGNED BYTE, one degree per bit. spec
+#: byte 2 bit 0 is the Trim/Tilt Override, which the display leaves off.
+TID_TRIM_COMMAND = 0x0403
+
+#: `0x1801 Engine Tilt/Trim`. The MEASURED angle, 1 Hz, ONE SIGNED BYTE.
+#:
+#: `0x0503 Trim/Tilt Angle Commanded Feedback` IS NOT THIS AND THE RIG DOES
+#: NOT SEND IT AS A POSITION. It is From: Brain, in the same command-echo
+#: family as 0x0500 throttle. A rig that answered a trim command on 0x0503
+#: would teach the display that an echo is a measurement.
+TID_TRIM_FEEDBACK = 0x1801
+
+#: The rig answers as the engine does, the Yanmar ToCAN device.
+TRIM_FEEDBACK_SOURCE = YANMAR_SOURCE
+
+#: How fast the modelled trim ram travels, in degrees per second.
+#:
+#: A FULL SWEEP MUST TAKE REAL TIME. The display's sweep is nominal to full
+#: up, then to full down, then back to nominal, which is about 150 degrees of
+#: travel. At 12 degrees per second that is twelve and a half seconds. A rig
+#: that jumped the feedback to the commanded value would let the display
+#: finish a sweep in one slice, and every rule about watching the metal move
+#: would be untested.
+TRIM_RATE_DEG_PER_S = 12.0
+
+#: How long a command stands before the ram stops. The display sends at
+#: 10 Hz, so half a second is five missed frames.
+#:
+#: IT IS A HOLD, NOT A TIMEOUT ON THE SWEEP. The DISPLAY decides when its
+#: sweep is finished, from this feedback. This only says what a modelled ram
+#: does when nobody is commanding it any more, which is stop.
+TRIM_COMMAND_HOLD_S = 0.5
+
+#: Where the modelled leg can physically go, in degrees.
+#:
+#: THE ENDS ARE THE RIG'S, NOT A DOCUMENT'S. Ben's specification says the
+#: command is in degrees and then says "Each vehicle will have a differing
+#: interpretation of what these degrees mean". It gives no travel and no end
+#: stop, so nothing here is quoted and nothing here is claimed to be
+#: measured. The rig has to stop somewhere, and these are where it stops.
+#:
+#: THE LOW END IS BELOW ZERO ON PURPOSE. 0x1801 is SIGNED, so a real drive
+#: can report a negative trim. The rig can be PLACED there by hand, which is
+#: how the bench proves the display DRAWS a reading it can never COMMAND.
+TRIM_MIN_DEG = -15.0
+TRIM_MAX_DEG = 90.0
+
 #: `0x0404 Linear Actuator Control`, from the DISPLAY at source 0x20.
 #: spec byte 1 is the ACTUATOR ADDRESS, spec byte 2 the percentage extension.
 TID_ACTUATOR_COMMAND = 0x0404
@@ -470,8 +525,17 @@ TELEMETRY_TABLE = (
      'alternator potential V'),             # 13.90 to 14.90 V
     (0x1800, YANMAR_SOURCE, 'rpm',                 1200.0, 400.0,  0.1,
      'engine rpm'),                         # 800 to 1600 rpm
-    (0x1801, YANMAR_SOURCE, 'tilt_trim',              4.0,   4.0,  1.0,
-     'engine tilt/trim deg'),               # 0 to 8 deg
+    # 0x1801 IS NOT HERE ANY MORE. IT IS A MODELLED DEVICE NOW.
+    #
+    # It used to be a free-running sine, 0 to 8 degrees, like every other row
+    # in this table. The display now COMMANDS the trim with 0x0403 and
+    # finishes step 2 on the MEASURED 0x1801 angle, so a sine would be a
+    # SECOND WRITER of the same TID, fighting the model frame for frame. The
+    # display would then watch a leg that never went where it was told and
+    # the step could never complete.
+    #
+    # `TrimModel` owns 0x1801 now, and `trim_worker` sends it at the same
+    # 1 Hz this row did.
     (0x1803, YANMAR_SOURCE, 'oil_temperature',       92.0,   5.0,  1.0,
      'engine oil temperature degC'),        # 87 to 97 degC
     (0x1804, YANMAR_SOURCE, 'engine_temperature',    82.0,   5.0,  1.0,
@@ -553,6 +617,7 @@ TELEMETRY = None
 SYSTEM_TEST = None
 RUDDER = None
 ACTUATORS = None
+TRIM = None
 
 
 def say(text):
@@ -1599,6 +1664,139 @@ class RudderModel:
                  "rudder feedback %d%%" % value)]
 
 
+class TrimModel:
+    """An engine trim that takes real time to move, and reports where it IS.
+
+    IT MOVES TOWARD THE COMMAND AT A RATE. It does not jump. A rig that
+    snapped the feedback to the commanded value would let the display finish
+    a whole sweep inside one slice, and every rule about watching the metal
+    move would be proved against nothing.
+
+    THE POSITION IS THE ONLY OUTPUT. This class does not know what a sweep is
+    and must not: the sweep lives in the display, and a rig that understood
+    it would be a second implementation of the thing under test.
+
+    THERE IS ONE UNIT. `0x1801 Engine Tilt/Trim` carries an angle and nothing
+    else: no engine index, no source address field. So one model answers it,
+    unlike the two hatch screws, which `0x1812` distinguishes by an address
+    inside the payload. If Ben ever adds a second engine, it arrives as a
+    second CAN SOURCE and this becomes one model per source.
+    """
+
+    def __init__(self, position=15.0):
+        self.lock = threading.Lock()
+        self.position = float(position)
+        self.command = None          # None means nobody is commanding
+        self.command_at = None
+        self.command_source = None
+        self.frozen = False          # the bench can stop the feedback
+        self.moving = False
+
+    def note_command(self, raw, source, now):
+        """One 0x0403 arrived. `raw` is the byte as it came off the wire.
+
+        IT IS READ AS UNSIGNED, BECAUSE THE DOCUMENT SAYS UNSIGNED.
+        TID_SPECIFICATION.md gives 0x0403 as "1 degree per bit (unsigned)"
+        and gives 0x1801 as signed. The rig reads it exactly as written. A
+        rig that quietly read it as signed would hide the mismatch from the
+        one bench that could find it.
+        """
+        with self.lock:
+            value = float(raw)
+            if not TRIM_MIN_DEG <= value <= TRIM_MAX_DEG:
+                # OUT OF THE MODELLED TRAVEL. The rig REFUSES it rather than
+                # clamping: a clamp would let a wrong command look like a
+                # good one, which is the same rule the rudder obeys.
+                return
+            self.command = value
+            self.command_at = now
+            self.command_source = source
+
+    def advance(self, now, dt):
+        """Move toward the command. Return the position."""
+        with self.lock:
+            target = self.command
+            if (target is not None and self.command_at is not None
+                    and (now - self.command_at) > TRIM_COMMAND_HOLD_S):
+                # NOBODY IS COMMANDING ANY MORE. The ram stops where it is.
+                # It does NOT return to nominal.
+                target = None
+                self.command = None
+            if target is None:
+                self.moving = False
+                return self.position
+            step = TRIM_RATE_DEG_PER_S * dt
+            gap = target - self.position
+            if abs(gap) <= step:
+                self.position = float(target)
+                self.moving = False
+            else:
+                self.position += step if gap > 0 else -step
+                self.moving = True
+            return self.position
+
+    def report(self):
+        with self.lock:
+            return {"position": self.position, "command": self.command,
+                    "source": self.command_source, "frozen": self.frozen,
+                    "moving": self.moving}
+
+    def freeze(self, on):
+        """Stop sending 0x1801, or send it again.
+
+        THE NEGATIVE TEST THIS EXISTS FOR: stop the feedback mid-travel and
+        the display must draw NO DATA and must NOT complete the step. A sweep
+        that finishes on a dead feedback is the failure step 2 exists to
+        catch.
+        """
+        with self.lock:
+            self.frozen = bool(on)
+
+    def frames(self):
+        """The 0x1801 frame, or nothing while the feedback is frozen.
+
+        THE WIRE BYTE IS SIGNED, one degree per bit, exactly as
+        TID_SPECIFICATION.md states for 0x1801. So a negative trim the
+        display could never command still reaches the glass.
+        """
+        with self.lock:
+            if self.frozen:
+                return []
+            value = int(round(self.position))
+            value = max(-128, min(127, value))
+        data = bytes([value & 0xFF]) + bytes(7)
+        return [(((TID_TRIM_FEEDBACK << 8) | TRIM_FEEDBACK_SOURCE), data,
+                 "engine tilt/trim %d deg" % value)]
+
+
+def trim_worker(sock, tx_lock, trim, stop_event):
+    """Move the modelled trim ram and report it at 1 Hz.
+
+    The specification gives 0x1801 a 1 Hz rate, so that is the REPORT period.
+    THE MODEL IS ADVANCED FAR MORE OFTEN THAN IT IS REPORTED, because a ram
+    stepped once a second would jump twelve degrees between frames and the
+    display would be watching a staircase rather than a mechanism.
+    """
+    report_period = 1.0
+    step_period = 0.05
+    last = time.monotonic()
+    next_report = last
+    while not stop_event.is_set():
+        now = time.monotonic()
+        dt = now - last
+        last = now
+        trim.advance(now, dt)
+        if now >= next_report:
+            next_report = now + report_period
+            for can_id, data, _label in trim.frames():
+                try:
+                    with tx_lock:
+                        send_frame(sock, can_id, data)
+                except OSError:
+                    pass
+        stop_event.wait(step_period)
+
+
 def rudder_worker(sock, tx_lock, rudder, stop_event):
     """Move the modelled ram and report it at 10 Hz.
 
@@ -1805,6 +2003,7 @@ def open_monitor_socket(interface):
     # display is 0x20, so its command is distinguishable from Marvin's 0x01.
     watched.append((TID_RUDDER_COMMAND << 8) | DISPLAY_SOURCE)
     watched.append((TID_ACTUATOR_COMMAND << 8) | DISPLAY_SOURCE)
+    watched.append((TID_TRIM_COMMAND << 8) | DISPLAY_SOURCE)
     can_filters = b"".join(
         struct.pack("=II", can_id | CAN_EFF_FLAG, mask)
         for can_id in watched)
@@ -1815,7 +2014,7 @@ def open_monitor_socket(interface):
 
 
 def system_test_monitor(sock, state, stop_event, rudder=None,
-                        actuators=None):
+                        actuators=None, trim=None):
     """Feed the node's system test from the frames actually on the bus.
 
     It notes evidence whether or not a test is running. `SpecterSystemTest`
@@ -1849,6 +2048,13 @@ def system_test_monitor(sock, state, stop_event, rudder=None,
             # spec byte 1 is data[0]. One signed byte, 1 percent per bit.
             if rudder is not None and dlc >= 1:
                 rudder.note_command(payload[0], source, now)
+            continue
+
+        if tid == TID_TRIM_COMMAND:
+            # spec byte 1 is data[0]. ONE UNSIGNED BYTE, 1 degree per bit.
+            # The model reads it unsigned because the document says unsigned.
+            if trim is not None and dlc >= 1:
+                trim.note_command(payload[0], source, now)
             continue
 
         if tid == TID_HEARTBEAT:
@@ -2139,6 +2345,21 @@ HELP_TEXT = "\n".join([
     "  wiggle <gain>     0 to %.0f. Turn the movement up or down"
     % WIGGLE_GAIN_MAX,
     "  telemetry         print what is on the wire and at what period",
+    # THE THREE MODELLED DEVICES. Each one answers a command from the display
+    # and reports where it IS, and each one can have its feedback stopped.
+    # `rudder` and `hatch` were never listed here; `trim` is new and all
+    # three are listed now, because a bench control nobody can find is a
+    # negative test nobody runs.
+    "  rudder            show the modelled rudder, 0x0402 in, 0x1811 out",
+    "  rudder freeze|thaw   stop or restart 0x1811. THE NEGATIVE TEST",
+    "  rudder port|starboard|centre|set <-100 to 100>   place the ram",
+    "  hatch             show the two modelled screws, 0x0404 in, 0x1812 out",
+    "  hatch freeze|thaw <side>  stop or restart 0x1812 for one hatch",
+    "  hatch open|close|set <0 to 100>   place a screw",
+    "  trim              show the modelled engine trim, 0x0403 in, 0x1801 out",
+    "  trim freeze|thaw  stop or restart 0x1801. THE NEGATIVE TEST",
+    "  trim up|down|centre|set <deg>   place the leg. IT REACHES BELOW ZERO,",
+    "                    which the display can DRAW and can never COMMAND",
     "  show              print the state and the next transmit frame",
     "  help              print this text",
     "  quit              stop and close the sockets",
@@ -2410,6 +2631,69 @@ def handle_command(state, stop_event, line):
             ]))
         return
 
+    if head == "trim":
+        want = parts[1].lower() if len(parts) > 1 else "show"
+        if want == "freeze":
+            # THE NEGATIVE TEST. Stop 0x1801 and the display must draw NO
+            # DATA and must NOT complete step 2. A sweep that finishes on a
+            # dead feedback is the failure that step exists to catch.
+            TRIM.freeze(True)
+            say("Trim feedback 0x1801 STOPPED. The leg still moves; "
+                "nothing reports where it is.")
+        elif want in ("thaw", "restore"):
+            TRIM.freeze(False)
+            say("Trim feedback 0x1801 is sent again.")
+        elif want in ("set", "up", "down"):
+            # PLACE THE LEG. It is a bench control, not a command: it moves
+            # the modelled position without anyone commanding 0x0403, so the
+            # display can be shown a reading it would otherwise only reach
+            # through a sweep that stops at its own tolerance.
+            #
+            # IT REACHES BELOW ZERO, WHICH THE DISPLAY CANNOT COMMAND. 0x1801
+            # is signed and 0x0403 is not, so a negative trim is a reading
+            # the glass must DRAW and the display can never ASK FOR. This is
+            # the only way to put one in front of it.
+            if want == "up":
+                value = TRIM_MAX_DEG
+            elif want == "down":
+                value = TRIM_MIN_DEG
+            else:
+                try:
+                    value = float(parts[2])
+                except (IndexError, ValueError):
+                    say("Use: trim set <%.0f to %.0f>, or trim up, "
+                        "or trim down." % (TRIM_MIN_DEG, TRIM_MAX_DEG))
+                    return
+            value = max(TRIM_MIN_DEG, min(TRIM_MAX_DEG, value))
+            with TRIM.lock:
+                TRIM.position = value
+                TRIM.command = None
+            say("Trim placed at %+.0f degrees. Nothing is commanded." % value)
+        elif want in ("centre", "center", "nominal"):
+            with TRIM.lock:
+                TRIM.position = 15.0
+                TRIM.command = None
+            say("Trim placed at nominal, 15 degrees. Nothing is commanded.")
+        else:
+            r = TRIM.report()
+            say("\n".join([
+                "-" * 66,
+                "The modelled engine trim. It moves at %.0f degrees per "
+                "second." % TRIM_RATE_DEG_PER_S,
+                "  measured 0x1801 : %+.1f deg%s"
+                % (r["position"],
+                   "   NOT SENT, frozen" if r["frozen"] else ""),
+                "  command  0x0403 : %s%s"
+                % ("none" if r["command"] is None
+                   else "%+.0f deg" % r["command"],
+                   "" if r["source"] is None
+                   else "   from source 0x%02X" % r["source"]),
+                "  moving          : %s" % r["moving"],
+                "  NOTE: the command is UNSIGNED and the feedback is SIGNED.",
+                "        That is Ben's document, not a choice here.",
+            ]))
+        return
+
     if head == "checks":
         # WHAT THE NODE MEASURED, from the frames on the WIRE.
         now = time.monotonic()
@@ -2663,10 +2947,11 @@ def main():
         "drop_status_after": args.drop_status_after,
     }
 
-    global TELEMETRY, SYSTEM_TEST, RUDDER, ACTUATORS
+    global TELEMETRY, SYSTEM_TEST, RUDDER, ACTUATORS, TRIM
     SYSTEM_TEST = SystemTestEmulator()
     RUDDER = RudderModel()
     ACTUATORS = ActuatorModel()
+    TRIM = TrimModel()
     TELEMETRY = TelemetryState(fuel_percent=args.fuel,
                                volts=args.volts,
                                wiggle=not args.no_wiggle)
@@ -2731,7 +3016,7 @@ def main():
     monitor_sock = open_monitor_socket(args.interface)
     monitor_thread = threading.Thread(
         target=system_test_monitor,
-        args=(monitor_sock, state, stop_event, RUDDER, ACTUATORS),
+        args=(monitor_sock, state, stop_event, RUDDER, ACTUATORS, TRIM),
         name="system-test-monitor", daemon=True)
     rudder_thread = threading.Thread(
         target=rudder_worker,
@@ -2741,6 +3026,10 @@ def main():
         target=actuator_worker,
         args=(tx_sock, tx_lock, ACTUATORS, stop_event),
         name="actuators", daemon=True)
+    trim_thread = threading.Thread(
+        target=trim_worker,
+        args=(tx_sock, tx_lock, TRIM, stop_event),
+        name="trim", daemon=True)
 
     rx_thread.start()
     tx_thread.start()
@@ -2750,6 +3039,7 @@ def main():
     monitor_thread.start()
     rudder_thread.start()
     actuator_thread.start()
+    trim_thread.start()
 
     if args.duration > 0:
         def stop_later():
