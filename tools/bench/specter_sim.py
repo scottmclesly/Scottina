@@ -112,6 +112,18 @@ try:
     )
     from specter_pkg.tocan_codec import decode_raw, encode_physical, encode_raw
     from specter_pkg.specter_session import SpecterSession
+    # STEP 3, THE SEAKEEPER RIDE. The node end lives in the display
+    # repository, because the real node runs it too: at STAGE 1 this rig IS
+    # the node, so it imports the same `RideController` rather than writing a
+    # second one. `RideSimModel` is the only thing here that is not real: it
+    # stands in for a Ride that is not on this bench.
+    from specter_pkg.specter_ride import (
+        RIDE_REPEAT_MS,
+        RidePhase,
+        RideController,
+        RideSimModel,
+        SPECTER_RIDE_STEP,
+    )
     from specter_pkg.tocan_ids import ToCanTid
     from specter_pkg.tocan_ids import (
         DISPLAY_CAN_SOURCE,
@@ -140,6 +152,33 @@ RX_CAN_ID = (TID_DISPLAY_FRAME << 8) | DISPLAY_SOURCE
 RX_HS_CAN_ID = (TID_HANDSHAKE_REQUEST << 8) | DISPLAY_SOURCE
 TX_CAN_ID = (TID_STATUS_FRAME << 8) | NODE_SOURCE
 TX_HS_CAN_ID = (TID_HANDSHAKE_RESPONSE << 8) | NODE_SOURCE
+
+# THE RIDE STATUS FRAME, node to display, 0x2482. The fifth SPECTER message.
+# It carries the MEASURED fin positions, which only the node can read, because
+# the Ride is on TCP and not on ToCAN. Its byte layout is in the display
+# repository, docs/reference/SPECTER_SPEC_DELTA.md section 5, and in the codec
+# this rig imports. It is NOT written again here.
+TID_RIDE_STATUS = int(SpecterTid.RIDE_STATUS)
+TX_RIDE_CAN_ID = (TID_RIDE_STATUS << 8) | NODE_SOURCE
+
+#: How often 0x2482 goes out. The same period as the status frame, and it is
+#: CONTINUOUS: a silent bus always means a fault and never means a state, so
+#: whether the Ride is reachable is carried in bit 0, never in the silence.
+RIDE_STATUS_PERIOD_S = 0.2
+
+#: How often the Ride loop runs. Far faster than the keypress rate, so the
+#: loop answers the measurement promptly and the RATE is set by the
+#: controller's own `RIDE_REPEAT_MS`, not by this sleep.
+RIDE_STEP_S = 0.05
+
+#: The step events the Ride hears. Everything else on step 3 is a checklist
+#: matter the generic branches already handle.
+RIDE_STEP_EVENTS = frozenset({
+    int(SpecterEventType.STEP_BEGIN),
+    int(SpecterEventType.STEP_CONFIRM),
+    int(SpecterEventType.STEP_RERUN),
+    int(SpecterEventType.STEP_ABORT),
+})
 
 CAN_EFF_FLAG = 0x80000000
 CAN_RTR_FLAG = 0x40000000
@@ -643,6 +682,7 @@ SYSTEM_TEST = None
 RUDDER = None
 ACTUATORS = None
 TRIM = None
+RIDE = None
 
 
 def say(text):
@@ -706,6 +746,15 @@ def event_name(value):
         return "UNDEFINED_%d" % value
 
 
+def ride_begin_owns_flag(states, ride_began):
+    """True when the Ride, step 3, answers `operator_input_requested`.
+
+    The status frame carries ONE flag for the whole checklist. It belongs to
+    the step most recently begun, and only while that step is still ACTIVE.
+    """
+    return ride_began and states[SPECTER_RIDE_STEP] == ACTIVE
+
+
 class SimState:
     """The authoritative step states and the handshake fields."""
 
@@ -763,6 +812,24 @@ class SimState:
         # prove the rig agrees with itself, and it would have reported four
         # healthy subsystems while the emitter thread was dead.
         self.checks = SpecterSystemTest()
+        # THE SEAKEEPER RIDE, STEP 3. THIS RIG IS THE NODE, SO IT RUNS THE
+        # NODE'S CONTROLLER.
+        #
+        # The display cannot reach the Ride: it is on TCP. It sends operator
+        # INTENT, `ACTUATE_UP`, `ACTUATE_DOWN` and `ACTUATE_STOP` with the
+        # target in byte 5, and this controller turns that into Ride keypad
+        # requests against the MEASURED positions. `ride_worker` owns the
+        # device model and sends 0x2482.
+        #
+        # ITS OWN LOCK. The Ride loop runs every 50 ms on its own thread and
+        # must never wait on the checklist lock, and no path here takes both.
+        self.ride = RideController()
+        self.ride_lock = threading.Lock()
+        #: True while step 3 was the step most recently BEGUN, so the status
+        #: frame's `operator_input_requested` is the Ride's to answer.
+        self.ride_began = False
+        #: The negative test. True stops 0x2482 altogether: the NODE is gone.
+        self.ride_frame_frozen = False
 
     def session_report(self):
         """Everything the tile shows about the session, in one lock."""
@@ -878,8 +945,11 @@ class SimState:
             self.hatch_cycle = None
             self.hatch_port = HATCH_STOPPED
             self.hatch_stbd = HATCH_STOPPED
+            self.ride_began = False
             if SESSION_BEGIN_ACTIVATES_FIRST_STEP:
                 self.states[0] = ACTIVE
+        with self.ride_lock:
+            self.ride.abort()
         # THE SESSION ID ADVANCES HERE AND NOWHERE ELSE. It is outside the
         # lock because SpecterSession holds its own state and this rig must
         # not take two locks in one path.
@@ -987,6 +1057,26 @@ class SimState:
                 % (step, SPECTER_STEP_CAPACITY))
             return
 
+        if event == int(SpecterEventType.STEP_BEGIN) and step != 0xFF:
+            # Whichever step was begun LAST owns `operator_input_requested`.
+            with self.lock:
+                self.ride_began = (step == SPECTER_RIDE_STEP)
+
+        if step == SPECTER_RIDE_STEP and event in RIDE_STEP_EVENTS:
+            # STEP 3 IS THE NODE'S TO ACTUATE. Begin starts the sweep, 0 to
+            # 100 to 0 percent on both surfaces; abort and restart stop it;
+            # confirm ends the sweep and LEAVES ANY RETRACT RUNNING, because
+            # the display's Next sends the retract first and waits for zero.
+            # The generic branches below still move the step table.
+            with self.ride_lock:
+                self.ride.on_display_event(event, 0)
+            if event == int(SpecterEventType.STEP_BEGIN):
+                say("AUTOMATIC RIDE SWEEP: both surfaces 0 -> 100 -> 0 "
+                    "percent, finishing on the MEASURED position.")
+            elif event != int(SpecterEventType.STEP_CONFIRM):
+                with self.lock:
+                    self.ride_began = False
+
         if event == int(SpecterEventType.SESSION_BEGIN):
             # SESSION_BEGIN marks step 0 ACTIVE, so the automatic test starts
             # with it. `begin` takes the clock, so the first-answer grace runs
@@ -1041,6 +1131,8 @@ class SimState:
         elif event == int(SpecterEventType.SESSION_ABORT):
             self.set_all(PENDING)
             self.checks.stop()
+            with self.ride_lock:
+                self.ride.abort()
             with self.lock:
                 self.operator_input_requested = False
                 self.hatch_port = HATCH_STOPPED
@@ -1050,6 +1142,8 @@ class SimState:
             self.session.end_session()
         elif event == int(SpecterEventType.SESSION_COMPLETE):
             self.checks.stop()
+            with self.ride_lock:
+                self.ride.abort()
             # The operator declares the run finished. It marks NO step GOOD.
             # The veto is derived from the step table, so setting steps here
             # would clear the veto on a checklist nobody actually ran, which
@@ -1083,6 +1177,24 @@ class SimState:
         # thread keeps its own schedule, so this only records the operator's
         # intent; the bench sees the last command win, which is what the
         # operator expects when they take hold of the pad.
+
+        if step == SPECTER_RIDE_STEP:
+            # THE SEAKEEPER RIDE. This used to be REFUSED: the actuate events
+            # were the payload hatch's alone. Step 3 sends them now, because
+            # the Ride is on TCP and the node is the only end that can move
+            # it. Only the node's controller decides what a press MEANS for a
+            # device with no per-side key; this rig just hands it over.
+            if target not in {int(x) for x in SpecterActuateTarget}:
+                say("REFUSED: ride target %d is not defined." % target)
+                return
+            with self.ride_lock:
+                self.ride.on_display_event(event, target)
+                driving = (self.ride.port_moving, self.ride.starboard_moving)
+            say("RIDE %s %s -> driving port %s, starboard %s"
+                % (event_name(event), target_name(target),
+                   "YES" if driving[0] else "no",
+                   "YES" if driving[1] else "no"))
+            return
 
         if step != HATCH_STEP:
             say("REFUSED: %s is for step %d, the payload hatch. It arrived "
@@ -1210,6 +1322,17 @@ class SimState:
             if states[SYSTEM_TEST_STEP] == ACTIVE:
                 operator_input = self.checks.operator_input_requested(now)
 
+        # STEP 3 IS THE NODE'S SWEEP, SO THE NODE SAYS WHEN IT IS FINISHED.
+        # The generic flag is cleared on STEP_BEGIN and nothing sets it for
+        # step 3, so without this the display's footer never learned the
+        # sweep had ended. It is true only once the surfaces MEASURED back at
+        # zero after MEASURING full travel.
+        with self.lock:
+            ride_began = self.ride_began
+        if ride_begin_owns_flag(states, ride_began):
+            with self.ride_lock:
+                operator_input = self.ride.operator_input_requested
+
         veto = not all(state == GOOD
                        for state in states[:SPECTER_STEPS_IN_USE])
 
@@ -1266,6 +1389,11 @@ class SimState:
                 self.operator_input_requested = False
                 self.hatch_port = HATCH_STOPPED
                 self.hatch_stbd = HATCH_STOPPED
+                self.ride_began = False
+            # The display restarted. Nothing it asked of the Ride before is
+            # being watched any more, so the Ride stops where it is.
+            with self.ride_lock:
+                self.ride.abort()
                 restarted = True
             self.handshakes_answered += 1
             session_id = self.session_id
@@ -1820,6 +1948,50 @@ def trim_worker(sock, tx_lock, trim, stop_event):
                 except OSError:
                     pass
         stop_event.wait(step_period)
+
+
+def ride_turn(state, ride, now_ms):
+    """One turn of the node's Ride loop. Return (0x2482 payload, keys pressed).
+
+    IT TOUCHES NO SOCKET, so a test can run the whole sweep through it. The
+    order is the real node's order: read the Ride, let the controller decide
+    from the MEASUREMENT, press what it asks for, and report what was read.
+    """
+    port, starboard, link = ride.measurement()
+    with state.ride_lock:
+        keys = state.ride.poll(now_ms, port, starboard,
+                               ride_link_up=link, fault=ride.fault)
+        payload = state.ride.status_payload()
+    for key in keys:
+        ride.press(key)
+    return payload, keys
+
+
+def ride_worker(sock, tx_lock, state, ride, stop_event):
+    """Run the Seakeeper Ride and report it on 0x2482, from boot to stop.
+
+    THE FRAME NEVER STOPS WHILE THE RIG RUNS. A silent bus always means a
+    fault and never means a state: whether the Ride is reachable is carried
+    in bit 0 of the frame, never in whether the frame is sent. `ride freeze`
+    is the one way to stop it, and it exists to prove the display copes when
+    the NODE is gone.
+
+    THE SIMULATED RIDE STARTS AT REST, BOTH SURFACES AT 0 PERCENT, so the
+    gauges read 0 and not NO DATA from the moment the rig is up.
+    """
+    next_report = time.monotonic()
+    while not stop_event.is_set():
+        now = time.monotonic()
+        payload, _keys = ride_turn(state, ride, int(now * 1000))
+        if now >= next_report:
+            next_report = now + RIDE_STATUS_PERIOD_S
+            if not state.ride_frame_frozen:
+                try:
+                    with tx_lock:
+                        send_frame(sock, TX_RIDE_CAN_ID, payload)
+                except OSError:
+                    pass
+        stop_event.wait(RIDE_STEP_S)
 
 
 def rudder_worker(sock, tx_lock, rudder, stop_event):
@@ -2385,6 +2557,13 @@ HELP_TEXT = "\n".join([
     "  trim freeze|thaw  stop or restart 0x1801. THE NEGATIVE TEST",
     "  trim up|down|centre|set <deg>   place the leg. IT REACHES BELOW ZERO,",
     "                    which the display can DRAW and can never COMMAND",
+    "  ride              show the SIMULATED Seakeeper Ride, step 3",
+    "                    0x2402 intent in, 0x2482 measured position out",
+    "  ride freeze|thaw  stop or restart 0x2482. THE NODE IS GONE",
+    "  ride lost|found   the Ride unreachable, 0x2482 still sent. A",
+    "                    DIFFERENT fault: the node is fine, the Ride is not",
+    "  ride fault|clear  the Ride reports an active fault, or not",
+    "  ride stow|set <port> [<stbd>]  place the surfaces, 0 to 100",
     "  show              print the state and the next transmit frame",
     "  help              print this text",
     "  quit              stop and close the sockets",
@@ -2653,6 +2832,87 @@ def handle_command(state, stop_event, line):
                    "" if r["source"] is None
                    else "   from source 0x%02X" % r["source"]),
                 "  moving          : %s" % r["moving"],
+            ]))
+        return
+
+    if head == "ride":
+        want = parts[1].lower() if len(parts) > 1 else "show"
+        if want == "freeze":
+            # THE NODE IS GONE. No 0x2482 at all. The display must draw NO
+            # DATA and must LET THE OPERATOR WALK: a hold nobody can end is
+            # a trap, and that trap took the whole keypad down on 2026-09-09.
+            state.ride_frame_frozen = True
+            say("Ride status 0x2482 STOPPED. As far as the display can tell, "
+                "the node is gone.")
+        elif want in ("thaw", "restore"):
+            state.ride_frame_frozen = False
+            say("Ride status 0x2482 is sent again.")
+        elif want == "lost":
+            # THE NODE IS FINE AND THE RIDE IS GONE. 0x2482 keeps coming with
+            # bit 0 clear. A different fault from `freeze`, and the display
+            # treats both the same because either way it has no measurement.
+            RIDE.reachable = False
+            say("The simulated Ride is UNREACHABLE. 0x2482 still goes out, "
+                "with the Ride link bit clear.")
+        elif want in ("found", "back"):
+            RIDE.reachable = True
+            say("The simulated Ride is reachable again.")
+        elif want == "fault":
+            RIDE.fault = True
+            say("The simulated Ride reports an active fault.")
+        elif want == "clear":
+            RIDE.fault = False
+            say("The simulated Ride fault is cleared.")
+        elif want in ("stow", "set"):
+            # PLACE THE SURFACES. A bench control, not a command: it moves
+            # the modelled blades without the node pressing anything, so the
+            # display can be shown a surface left deployed and made to hold
+            # the walk until it is retracted.
+            if want == "stow":
+                port = starboard = 0
+            else:
+                try:
+                    port = int(parts[2])
+                    starboard = int(parts[3]) if len(parts) > 3 else port
+                except (IndexError, ValueError):
+                    say("Use: ride set <port 0 to 100> [<starboard>], "
+                        "or ride stow.")
+                    return
+            RIDE.port = max(0, min(100, port))
+            RIDE.starboard = max(0, min(100, starboard))
+            say("Ride placed at port %d, starboard %d percent. Nothing is "
+                "commanded." % (RIDE.port, RIDE.starboard))
+        else:
+            with state.ride_lock:
+                phase = state.ride.phase
+                driving = (state.ride.port_moving, state.ride.starboard_moving)
+                done = state.ride.operator_input_requested
+                polarity = state.ride.check_polarity()
+            say("\n".join([
+                "-" * 66,
+                "The SIMULATED Seakeeper Ride, step 3. 0x2402 intent in, "
+                "0x2482 out.",
+                "  surfaces        : port %d%%, starboard %d%%"
+                % (RIDE.port, RIDE.starboard),
+                "  Ride reachable  : %s%s" % (
+                    RIDE.reachable, "" if not RIDE.fault else
+                    "   *** ACTIVE FAULT ***"),
+                "  0x2482          : %s" % ("NOT SENT, frozen"
+                                            if state.ride_frame_frozen
+                                            else "every %d ms"
+                                            % int(RIDE_STATUS_PERIOD_S * 1000)),
+                "  node sweep      : %s%s" % (
+                    phase.name, "   finished, waiting for the operator"
+                    if done else ""),
+                "  node driving    : port %s, starboard %s" % (
+                    "YES" if driving[0] else "no",
+                    "YES" if driving[1] else "no"),
+                "  list polarity   : %s" % (
+                    "no disagreement seen" if polarity is None
+                    else "WRONG. The key that deploys port is %r" % polarity),
+                "  NOTE: this is a MODEL. It proves the display and the loop,",
+                "        never how a real Ride moves. That is stage 2.",
+                "-" * 66,
             ]))
         return
 
@@ -2973,11 +3233,12 @@ def main():
         "drop_status_after": args.drop_status_after,
     }
 
-    global TELEMETRY, SYSTEM_TEST, RUDDER, ACTUATORS, TRIM
+    global TELEMETRY, SYSTEM_TEST, RUDDER, ACTUATORS, TRIM, RIDE
     SYSTEM_TEST = SystemTestEmulator()
     RUDDER = RudderModel()
     ACTUATORS = ActuatorModel()
     TRIM = TrimModel()
+    RIDE = RideSimModel()
     TELEMETRY = TelemetryState(fuel_percent=args.fuel,
                                volts=args.volts,
                                wiggle=not args.no_wiggle)
@@ -2999,6 +3260,10 @@ def main():
         % (TX_CAN_ID, TID_STATUS_FRAME, NODE_SOURCE))
     say("            can_id 0x%06X (tid 0x%04X, source 0x%02X) handshake response"
         % (TX_HS_CAN_ID, TID_HANDSHAKE_RESPONSE, NODE_SOURCE))
+    say("            can_id 0x%06X (tid 0x%04X, source 0x%02X) ride status, "
+        "%d ms, SIMULATED Ride" % (TX_RIDE_CAN_ID, TID_RIDE_STATUS,
+                                   NODE_SOURCE,
+                                   int(RIDE_STATUS_PERIOD_S * 1000)))
     say("TX period : %d ms" % int(TX_PERIOD_S * 1000))
     say("Stale limit: %.0f s" % STALE_LIMIT_S)
     say("Checklist : %d steps at indices 0 to %d. Slot %d is the shore link."
@@ -3056,6 +3321,10 @@ def main():
         target=trim_worker,
         args=(tx_sock, tx_lock, TRIM, stop_event),
         name="trim", daemon=True)
+    ride_thread = threading.Thread(
+        target=ride_worker,
+        args=(tx_sock, tx_lock, state, RIDE, stop_event),
+        name="ride", daemon=True)
 
     rx_thread.start()
     tx_thread.start()
@@ -3066,6 +3335,7 @@ def main():
     rudder_thread.start()
     actuator_thread.start()
     trim_thread.start()
+    ride_thread.start()
 
     if args.duration > 0:
         def stop_later():

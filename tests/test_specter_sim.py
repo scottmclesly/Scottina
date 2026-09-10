@@ -188,5 +188,190 @@ class TestTheWholeWalkAdvances(SimTestCase):
                          "13 confirmed steps is a complete checklist")
 
 
+# --------------------------------------------------------------------------
+# STEP 3, THE SEAKEEPER RIDE.
+# --------------------------------------------------------------------------
+# On the bench on 2026-09-10 the Ride screen showed its gauges greyed out and
+# Start test did nothing. The display was right: it sent STEP_BEGIN on step 3
+# ten times that day and this rig accepted every one. THE RIG HAD NO RIDE. It
+# ran no sweep, sent no 0x2482, never set operator_input_requested for step 3,
+# and REFUSED every actuate event that was not on step 4.
+
+try:
+    from specter_pkg.specter_ride import RideSimModel, RidePhase
+    from specter_pkg.tocan_codec import SpecterActuateTarget, decode_ride_status
+except BaseException:     # skipped with the rest when the codec is absent
+    RideSimModel = None
+
+
+@unittest.skipIf(CODEC, CODEC or "")
+class TestTheSeakeeperRide(SimTestCase):
+    """The node end of step 3, the way the display drives it."""
+
+    RIDE = 3
+
+    def setUp(self):
+        super().setUp()
+        self.ride = RideSimModel()
+        self.now = 0
+
+    def turn(self, count=1):
+        """Run the node's Ride loop. Return the last 0x2482, decoded."""
+        payload = None
+        for _ in range(count):
+            self.now += specter_sim.RIDE_REPEAT_MS
+            payload, _keys = specter_sim.ride_turn(self.state, self.ride,
+                                                   self.now)
+        return decode_ride_status(payload)
+
+    def flag(self):
+        _data, fields = self.state.build_frame()
+        return fields["operator_input_requested"]
+
+    def test_at_rest_the_ride_reports_zero_not_no_data(self):
+        """OBSERVATION 1. The gauges were greyed out over a Ride at rest."""
+        got = self.turn()
+        self.assertTrue(got["ride_link_up"])
+        self.assertTrue(got["port_valid"] and got["starboard_valid"],
+                        "a Ride at rest is a MEASUREMENT of zero")
+        self.assertEqual((got["port_percent"], got["starboard_percent"]),
+                         (0, 0))
+        self.assertFalse(got["port_moving"] or got["starboard_moving"])
+
+    def test_start_test_runs_the_sweep_out_and_back(self):
+        """OBSERVATION 2. Start test must sweep 0 -> 100 -> 0 and finish."""
+        self.state._run_event(event(SpecterEventType.STEP_BEGIN,
+                                    step=self.RIDE))
+        self.assertEqual(self.steps()[self.RIDE], specter_sim.ACTIVE)
+        self.assertEqual(self.state.ride.phase, RidePhase.TO_FULL)
+
+        saw_moving = False
+        saw_full = False
+        for _ in range(400):
+            got = self.turn()
+            if got["port_moving"] and got["starboard_moving"]:
+                saw_moving = True
+                self.assertFalse(self.flag(),
+                                 "no Next while the surfaces travel")
+            if min(got["port_percent"], got["starboard_percent"]) >= 97:
+                saw_full = True
+            if self.state.ride.phase == RidePhase.DONE:
+                break
+
+        self.assertTrue(saw_moving,
+                        "the moving bits drive the During test footer")
+        self.assertTrue(saw_full, "both surfaces MEASURED full travel")
+        self.assertEqual(self.state.ride.phase, RidePhase.DONE)
+        got = self.turn()
+        self.assertLessEqual(max(got["port_percent"],
+                                 got["starboard_percent"]), 3,
+                             "and came back to zero")
+        self.assertTrue(self.flag(),
+                        "the node hands back to the operator: After test")
+        self.assertEqual(self.steps()[self.RIDE], specter_sim.ACTIVE,
+                         "ACTIVE, not GOOD. Only the operator confirms")
+
+    def test_the_ride_actuate_events_are_no_longer_refused(self):
+        self.state._run_event(event(SpecterEventType.STEP_BEGIN,
+                                    step=self.RIDE, sequence=1))
+        self.state._run_event(event(SpecterEventType.ACTUATE_UP,
+                                    step=self.RIDE,
+                                    param=int(SpecterActuateTarget.PORT),
+                                    sequence=2))
+        self.assertFalse(any("REFUSED" in line for line in self.said),
+                         "step 3's actuate events used to be refused")
+        self.assertTrue(self.state.ride.port_moving)
+        self.assertFalse(self.state.ride.starboard_moving,
+                         "PORT was asked for, and the sweep's starboard "
+                         "target went with the sweep")
+
+    def test_an_undefined_target_is_refused(self):
+        self.state._run_event(event(SpecterEventType.ACTUATE_UP,
+                                    step=self.RIDE, param=7))
+        self.assertTrue(any("REFUSED" in line for line in self.said))
+
+    def test_an_actuate_on_any_other_step_is_still_refused(self):
+        self.state._run_event(event(SpecterEventType.ACTUATE_UP, step=5))
+        self.assertTrue(any("REFUSED" in line for line in self.said))
+
+    def test_confirm_leaves_a_retract_running(self):
+        """The display's Next sends the retract, then the confirm, then waits
+        for a MEASURED zero. A confirm that stopped the retract held the
+        operator on the screen."""
+        self.ride.port = self.ride.starboard = 80
+        self.turn()
+        self.state._run_event(event(SpecterEventType.ACTUATE_DOWN,
+                                    step=self.RIDE, sequence=1))
+        self.state._run_event(event(SpecterEventType.STEP_CONFIRM,
+                                    step=self.RIDE, sequence=2))
+        self.assertEqual(self.steps()[self.RIDE], specter_sim.GOOD)
+        self.assertTrue(self.state.ride.port_moving,
+                        "the retract is still driven after the confirm")
+        for _ in range(200):
+            self.turn()
+        self.assertTrue(self.state.ride.all_stowed)
+
+    def test_restart_stops_the_ride(self):
+        self.state._run_event(event(SpecterEventType.STEP_BEGIN,
+                                    step=self.RIDE, sequence=1))
+        self.turn(4)
+        self.state._run_event(event(SpecterEventType.STEP_RERUN,
+                                    step=self.RIDE, sequence=2))
+        self.assertFalse(self.state.ride.port_moving
+                         or self.state.ride.starboard_moving)
+        self.assertEqual(self.steps()[self.RIDE], specter_sim.PENDING)
+
+    def test_a_new_session_stops_the_ride(self):
+        self.state._run_event(event(SpecterEventType.STEP_BEGIN,
+                                    step=self.RIDE, sequence=1))
+        self.turn(4)
+        self.state._run_event(event(SpecterEventType.SESSION_BEGIN,
+                                    sequence=2))
+        self.assertEqual(self.state.ride.phase, RidePhase.IDLE)
+        self.assertFalse(self.state.ride.port_moving)
+
+    def test_the_flag_belongs_to_the_step_begun_last(self):
+        self.state._run_event(event(SpecterEventType.STEP_BEGIN,
+                                    step=self.RIDE, sequence=1))
+        for _ in range(400):
+            self.turn()
+            if self.state.ride.phase == RidePhase.DONE:
+                break
+        self.assertTrue(self.flag())
+        self.state._run_event(event(SpecterEventType.STEP_BEGIN, step=5,
+                                    sequence=2))
+        self.assertFalse(self.flag(),
+                         "step 5 was begun since. The Ride no longer answers")
+
+    def test_the_console_negative_tests(self):
+        stop = specter_sim.threading.Event()
+        saved = specter_sim.RIDE
+        specter_sim.RIDE = self.ride
+        try:
+            specter_sim.handle_command(self.state, stop, "ride lost")
+            got = self.turn()
+            self.assertFalse(got["ride_link_up"], "the Ride is unreachable")
+            self.assertFalse(got["port_valid"],
+                             "so nothing is reported as a measurement")
+            specter_sim.handle_command(self.state, stop, "ride found")
+            self.assertTrue(self.turn()["ride_link_up"])
+
+            specter_sim.handle_command(self.state, stop, "ride freeze")
+            self.assertTrue(self.state.ride_frame_frozen,
+                            "the node is gone: 0x2482 stops altogether")
+            specter_sim.handle_command(self.state, stop, "ride thaw")
+            self.assertFalse(self.state.ride_frame_frozen)
+
+            specter_sim.handle_command(self.state, stop, "ride set 60 20")
+            got = self.turn()
+            self.assertEqual((got["port_percent"],
+                              got["starboard_percent"]), (60, 20))
+            specter_sim.handle_command(self.state, stop, "ride")
+            self.assertTrue(any("SIMULATED Seakeeper Ride" in line
+                                for line in self.said))
+        finally:
+            specter_sim.RIDE = saved
+
+
 if __name__ == "__main__":
     unittest.main()

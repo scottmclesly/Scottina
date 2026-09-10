@@ -273,3 +273,26 @@ control is **panel-only** — the tile exports no `model_buttons()`, so the web
 mirror cannot press it and WEB-PROTOCOL.md §10 still holds: a hostile actor on
 the LAN has no code path to the bus. `tests/test_specterlink.py` pins both
 properties. See `kilodash/screens/specter.py`.
+
+### Step 3, the Seakeeper Ride
+
+The Ride is on TCP and not on ToCAN, so the NODE actuates it and reports what
+it measured on `0x2482`, the fifth SPECTER message. At stage 1 this rig is the
+node, so `specter_sim.py` runs the node's own `RideController`, imported from
+`specter_pkg.specter_ride` in the display repository, against `RideSimModel`,
+a **simulated** Ride. Nothing here has touched a real Seakeeper.
+
+- `0x2482` goes out every 200 ms from start to stop, both surfaces at 0 percent
+  at rest, so the display's gauges read 0 and not NO DATA.
+- `STEP_BEGIN` on step 3 runs the sweep, 0 to 100 to 0 percent on both
+  surfaces, finishing on the MEASURED position. The node then sets
+  `operator_input_requested` and the display offers Next.
+- `ACTUATE_UP`, `ACTUATE_DOWN` and `ACTUATE_STOP` on step 3 are the d-pad.
+  They used to be REFUSED unless they named step 4.
+- Console: `ride` shows it. `ride freeze|thaw` stops the frame (the node is
+  gone). `ride lost|found` keeps the frame with the Ride link bit clear (the
+  Ride is gone). `ride fault|clear`, `ride stow`, `ride set <port> [<stbd>]`.
+
+`specter_tile.py` builds its own threads and starts NO device worker, the Ride
+included, the same as the rudder, the trim and the hatches. Use the NODE
+button, which runs `specter_sim.py` under `specter-sim.service`.
