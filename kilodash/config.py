@@ -32,7 +32,7 @@ DEFAULTS = {
 
     # --- display ---
     "flip_180": {"value": False, "type": "bool",
-                 "label": "Flip display 180 (software)", "group": "Display"},
+                 "label": "Flip vertically", "group": "Display"},
     "dim_enabled": {"value": True, "type": "bool",
                     "label": "Screen dimming", "group": "Display"},
     "dim_timeout_sec": {"value": 600, "type": "int", "min": 30, "max": 1800,
