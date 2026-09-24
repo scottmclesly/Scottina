@@ -200,17 +200,17 @@ GROUP_LETTERS = ["S", "P", "E1", "C", "T", "E2", "R"]
 
 # Each group covers a fixed set of step indices. The seven sets partition
 # 0 to 11 exactly once, so every step belongs to one group and no step
-# belongs to two. POWER ACC MODE WAS REMOVED from the checklist on
-# 2026-09-24 and every step after it moved down one, which is why the
-# checklist id is 0x0002. The rollup rule is display-side and is not on the wire.
+# belongs to two. POWER ACC MODE WAS REMOVED and THE NAVIGATION LIGHTS MOVED
+# to run between the ventilation and the E-STOP, both on 2026-09-24. The
+# lights are step 6 and the checklist id is 0x0003. The rollup rule is display-side and is not on the wire.
 GROUP_STEPS = {
     1: (1, 2, 3),
     2: (4,),
-    3: (0, 11),
-    4: (7,),
-    5: (8,),
-    6: (6,),
-    7: (5, 9, 10),
+    3: (0, 6),
+    4: (8,),
+    5: (9,),
+    6: (7,),
+    7: (5, 10, 11),
 }
 
 # The shore link is NOT a checklist step. It is never walked, never started
