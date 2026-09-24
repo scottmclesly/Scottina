@@ -67,6 +67,19 @@ PERIOD_WINDOW = 40
 WIDTH = 78
 
 RX_CAN_ID = specter_sim.RX_CAN_ID
+
+# THE E-STOP STATE FRAME, 0x2404 from the display, 0x20. The display reads the
+# E-Stop contact on its own Input 1 and relays it, because the E-Stop box is
+# not on ToCAN. The layout is in the SPECTER repository,
+# docs/reference/SPECTER_SPEC_DELTA.md section 7:
+#   byte 0  liveness counter
+#   byte 1  1 ARMED, 0 TRIPPED. Nothing else is defined
+#   byte 2  fault. 0x00 UNKNOWN. Nothing else is defined
+# A receiver treats the E-Stop as TRIPPED after 300 ms with no frame, which is
+# three periods.
+ESTOP_CAN_ID = (0x2404 << 8) | 0x20
+ESTOP_PERIOD_S = 0.1
+ESTOP_STALE_S = 0.3
 TX_CAN_ID = specter_sim.TX_CAN_ID
 GROUP_LETTERS = specter_sim.GROUP_LETTERS
 STEP_STATES = specter_sim.STEP_STATES
@@ -169,6 +182,41 @@ class RxStats:
                 "stale_events": self.stale_events,
                 "errors": self.errors,
                 "last_error": self.last_error,
+            }
+
+
+class EstopStats:
+    """Counters for the E-Stop frame. The estop thread is the only writer."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.frames = 0
+        self.last_rx = None
+        self.armed = None
+        self.counter = None
+        self.fault = None
+        self.changes = 0
+
+    def record(self, data, now):
+        with self.lock:
+            armed = data[1] == 1
+            if self.armed is not None and armed != self.armed:
+                self.changes += 1
+            self.frames += 1
+            self.last_rx = now
+            self.armed = armed
+            self.counter = data[0]
+            self.fault = data[2]
+
+    def snapshot(self):
+        with self.lock:
+            return {
+                "frames": self.frames,
+                "last_rx": self.last_rx,
+                "armed": self.armed,
+                "counter": self.counter,
+                "fault": self.fault,
+                "changes": self.changes,
             }
 
 
@@ -332,6 +380,46 @@ def rx_worker(sock, stop_event, stats, log):
         stats.record(data, specter_sim.decode_heartbeat(data), time.monotonic())
 
 
+def open_estop_socket(interface):
+    """A socket of its own, filtered to the E-Stop frame alone.
+
+    The receive worker decodes every frame it gets as the display frame, so
+    the E-Stop frame gets its own socket rather than a share of that one.
+    """
+    sock = socket.socket(socket.PF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
+    can_filter = struct.pack("=II", ESTOP_CAN_ID | specter_sim.CAN_EFF_FLAG,
+                             specter_sim.CAN_EFF_MASK | specter_sim.CAN_EFF_FLAG)
+    sock.setsockopt(socket.SOL_CAN_RAW, socket.CAN_RAW_FILTER, can_filter)
+    sock.bind((interface,))
+    sock.settimeout(0.2)
+    return sock
+
+
+def estop_worker(sock, stop_event, stats, log):
+    """Count E-Stop frames. It only writes counters. It never renders."""
+    last_report = 0.0
+    while not stop_event.is_set():
+        try:
+            packet = sock.recv(specter_sim.CAN_FRAME_SIZE)
+        except socket.timeout:
+            continue
+        except OSError as error:
+            if stop_event.is_set() or error.errno == errno.EBADF:
+                return
+            now = time.monotonic()
+            if now - last_report >= 5.0:
+                last_report = now
+                log.add("E-Stop rx error: %s" % error)
+            stop_event.wait(0.2)
+            continue
+
+        _can_id, dlc, payload = struct.unpack(specter_sim.CAN_FRAME_FMT, packet)
+        data = payload[:dlc]
+        if len(data) != 8:
+            continue
+        stats.record(data, time.monotonic())
+
+
 def tx_worker(sock, state, stop_event, stats, log):
     """Send the node status every 500 ms. A send error must not stop it."""
     last_report = 0.0
@@ -389,7 +477,7 @@ def format_uptime(seconds):
 
 
 def build_tile(interface, started, state, rx_stats, tx_stats, health, log,
-               palette):
+               palette, estop_stats):
     """Build every line of the tile. Take snapshots, then format."""
     rx = rx_stats.snapshot()
     tx = tx_stats.snapshot()
@@ -422,6 +510,33 @@ def build_tile(interface, started, state, rx_stats, tx_stats, health, log,
     else:
         badge = palette.paint("[  STALE  ]", Palette.RED)
     lines.append("   %-9s%s   %s" % ("LINK", badge, age_text))
+
+    # THE E-STOP, 0x2404. NO DATA IS ITS OWN ANSWER: no frame means the
+    # display is gone, which is a different fault from a tripped E-Stop, and
+    # the last state is never held over a dead bus.
+    #
+    # TRIPPED IS EVERYTHING THAT IS NOT PROVEN CLOSED: a pressed E-Stop, a cut
+    # wire, a dead box, and a debounce that has not settled all read the same
+    # here, on purpose.
+    estop = estop_stats.snapshot()
+    if estop["last_rx"] is None or (now - estop["last_rx"]) > ESTOP_STALE_S:
+        estop_badge = palette.paint("[ NO DATA ]", Palette.YELLOW)
+        if estop["last_rx"] is None:
+            estop_text = "no 0x%06X since start" % ESTOP_CAN_ID
+        else:
+            estop_text = ("no frame for %.2f s. The display is gone, which is "
+                          "NOT a trip" % (now - estop["last_rx"]))
+    elif estop["armed"]:
+        estop_badge = palette.paint("[  ARMED  ]", Palette.GREEN)
+        estop_text = ("contact PROVEN closed   live %3d   fault 0x%02X   "
+                      "changes %d"
+                      % (estop["counter"], estop["fault"], estop["changes"]))
+    else:
+        estop_badge = palette.paint("[ TRIPPED ]", Palette.RED)
+        estop_text = ("pressed, cut wire, dead box or unproven   live %3d   "
+                      "fault 0x%02X   changes %d"
+                      % (estop["counter"], estop["fault"], estop["changes"]))
+    lines.append("   %-9s%s   %s" % ("E-STOP", estop_badge, estop_text))
 
     periods = rx["periods"]
     if periods:
@@ -816,6 +931,7 @@ def main():
     try:
         rx_sock = specter_sim.open_rx_socket(args.interface)
         tx_sock = specter_sim.open_tx_socket(args.interface)
+        estop_sock = open_estop_socket(args.interface)
     except OSError as error:
         sys.stderr.write("ERROR: cannot open %s: %s\n" % (args.interface, error))
         return 1
@@ -830,6 +946,7 @@ def main():
                                  args.session_id & 0xFF,
                                  args.checklist_version & 0xFF)
     rx_stats = RxStats()
+    estop_stats = EstopStats()
     tx_stats = TxStats()
     health = Health()
     stop_event = threading.Event()
@@ -848,7 +965,7 @@ def main():
 
     def painter():
         lines = build_tile(args.interface, started, state, rx_stats, tx_stats,
-                           health, log, palette)
+                           health, log, palette, estop_stats)
         line_count[0] = len(lines)
         screen.paint(lines)
 
@@ -856,6 +973,9 @@ def main():
         threading.Thread(target=rx_worker,
                          args=(rx_sock, stop_event, rx_stats, log),
                          name="rx", daemon=True),
+        threading.Thread(target=estop_worker,
+                         args=(estop_sock, stop_event, estop_stats, log),
+                         name="estop", daemon=True),
         threading.Thread(target=tx_worker,
                          args=(tx_sock, state, stop_event, tx_stats, log),
                          name="tx", daemon=True),
@@ -891,6 +1011,7 @@ def main():
             thread.join(timeout=2.0)
         rx_sock.close()
         tx_sock.close()
+        estop_sock.close()
         screen.finish(line_count[0])
         rx = rx_stats.snapshot()
         tx = tx_stats.snapshot()
