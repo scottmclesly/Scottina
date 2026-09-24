@@ -75,6 +75,8 @@ class SpecterScreen(Screen):
         self.tick_interval = IDLE_TICK
         self.display = SL.LinkState(SL.DISPLAY_CAN_ID, "DISPLAY")
         self.node = SL.LinkState(SL.NODE_CAN_ID, "NODE")
+        # THE E-STOP, 0x240420. The Screen relays its own Input 1 contact.
+        self.estop = SL.LinkState(SL.ESTOP_CAN_ID, "ESTOP")
         self.reader = None
         self.bus = SL.parse_can_link("")
         self._bus_at = 0.0
@@ -99,7 +101,7 @@ class SpecterScreen(Screen):
     def _start_reader(self):
         if self.reader and self.reader.alive:
             return
-        self.reader = SL.SpecterReader(IFACE, self.display, self.node).start()
+        self.reader = SL.SpecterReader(IFACE, self.display, self.node, estop_link=self.estop).start()
 
     def _poll_bus(self, force=False):
         now = time.monotonic()
@@ -206,6 +208,38 @@ class SpecterScreen(Screen):
         """
         rows = []
         disp, node = self._snap
+
+        # ---- THE E-STOP, FIRST, BECAUSE IT IS THE ONE THAT STOPS THE BOAT --
+        #
+        # NO DATA IS ITS OWN ANSWER. No frame for 300 ms means the Screen is
+        # gone, which is a different fault from a tripped E-Stop, and the
+        # last state is never held over a dead bus.
+        #
+        # TRIPPED IS EVERYTHING THAT IS NOT PROVEN CLOSED: a pressed E-Stop,
+        # a cut wire, a dead box, and a debounce that has not settled.
+        estop = self.estop.snapshot()
+        ef = estop.get("fields") or {}
+        age = None
+        if estop.get("last_rx") is not None:
+            age = time.time() - estop["last_rx"]
+        if not ef or age is None or age > SL.ESTOP_STALE_S:
+            rows.append({
+                "label": "E-STOP",
+                "value": ("no 0x%06X. The Screen is not reporting, which is "
+                          "NOT a trip" % SL.ESTOP_CAN_ID),
+                "state": "caution",
+            })
+        else:
+            armed = ef.get("armed", False)
+            rows.append({
+                "label": "E-STOP",
+                "value": ("%s   live %3d   fault 0x%02X   %d frames"
+                          % (ef.get("state_text", "TRIPPED"),
+                             ef.get("sequence", 0), ef.get("fault", 0),
+                             estop.get("frames", 0))),
+                "state": "ok" if armed else "alarm",
+            })
+
         df = disp.get("fields") or {}
         nf = node.get("fields") or {}
         hs_req, hs_rsp = getattr(self, "_hs", (None, None))

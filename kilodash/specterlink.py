@@ -71,6 +71,16 @@ DISPLAY_CAN_ID = 0x240220        # the Screen's display frame
 NODE_CAN_ID = 0x248021           # the boat side's status frame
 HS_REQUEST_CAN_ID = 0x240320     # the Screen asks for a handshake
 HS_RESPONSE_CAN_ID = 0x248121    # the boat side answers
+# THE E-STOP STATE FRAME. The Screen reads the E-Stop contact on its own
+# Input 1, which is J1 pin 10 on the bench unit, and relays it, because the
+# E-Stop box is not on ToCAN. 100 ms, fixed, from boot to power off.
+#   byte 0  liveness counter
+#   byte 1  1 ARMED, 0 TRIPPED. Nothing else is defined
+#   byte 2  fault. 0x00 UNKNOWN. Nothing else is defined
+# A reader treats the E-Stop as TRIPPED after 300 ms with no frame, which is
+# three periods.
+ESTOP_CAN_ID = 0x240420          # the Screen relays the E-Stop contact
+ESTOP_STALE_S = 0.3
 
 #: The 13 steps, in the order the wire numbers them. The panel shows a name
 #: against each state, because "step 7 FAULT" means nothing across a bench and
@@ -311,17 +321,21 @@ SYSTEM_TEST_STEP = 0             # the step these four results belong to
 GROUP_LETTERS = ("S", "P", "E1", "C", "T", "E2", "R")
 
 
-STEPS_IN_USE = 13                # steps 0 to 12 on the wire
+STEPS_IN_USE = 12                # steps 0 to 11 on the wire
 STEP_CAPACITY = 24               # packed slots the status frame carries
 SHORE_LINK_SLOT = 13             # not a step. The shore link only
 
 # Each group covers a fixed set of step indices. The seven sets partition
-# 0 to 12 exactly once, so every step belongs to one group and no step
+# 0 to 11 exactly once, so every step belongs to one group and no step
 # belongs to two. This is a rollup for the strip. It is not on the wire.
+#
+# POWER ACC MODE WAS REMOVED and THE NAVIGATION LIGHTS MOVED to run between
+# the ventilation and the E-STOP, both on 2026-09-24. The lights are step 6
+# and the checklist id is 0x0003.
 GROUP_STEPS = (
     (1, 2, 3),
     (4,),
-    (0, 6, 12),
+    (0, 6),
     (8,),
     (9,),
     (7,),
@@ -433,11 +447,35 @@ def syscheck_reported(system_test):
     return all(value != PENDING for value in system_test)
 
 
+def decode_estop(data):
+    """Decode the E-Stop state frame, 0x240420.
+
+    TRIPPED IS EVERYTHING THAT IS NOT PROVEN CLOSED: a pressed E-Stop, a cut
+    wire, a dead E-Stop box, and a Screen whose debounce has not settled all
+    read the same here, on purpose. Byte 1 is armed ONLY when it is 1.
+    """
+    if data is None or len(data) != 8:
+        return None
+    return {
+        "armed": data[1] == 1,
+        "state_text": "ARMED" if data[1] == 1 else "TRIPPED",
+        "fault": data[2],
+        # LinkState counts gaps and repeats from this.
+        "sequence": data[0],
+        # THE E-STOP FRAME CARRIES NO STEP STATES. `snapshot()` reads this
+        # key on every decoder, so it is present and it is None. It is not a
+        # placeholder for a value that might arrive: the step states live in
+        # the status frame and nowhere else.
+        "states": None,
+    }
+
+
 DECODERS = {
     DISPLAY_CAN_ID: decode_display,
     NODE_CAN_ID: decode_node,
     HS_REQUEST_CAN_ID: decode_hs_request,
     HS_RESPONSE_CAN_ID: decode_hs_response,
+    ESTOP_CAN_ID: decode_estop,
 }
 
 
@@ -543,8 +581,10 @@ class SpecterReader:
     """
 
     def __init__(self, iface, display_link, node_link,
-                 hs_request_link=None, hs_response_link=None):
+                 hs_request_link=None, hs_response_link=None,
+                 estop_link=None):
         self.iface = iface
+        self.estop = estop_link or LinkState(ESTOP_CAN_ID, "ESTOP")
         self.hs_request = hs_request_link or LinkState(HS_REQUEST_CAN_ID,
                                                        "HS-REQ")
         self.hs_response = hs_response_link or LinkState(HS_RESPONSE_CAN_ID,
@@ -569,11 +609,12 @@ class SpecterReader:
 
     def _filter(self):
         mask = CAN_EFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG
-        return struct.pack("=IIIIIIII",
+        return struct.pack("=IIIIIIIIII",
                            DISPLAY_CAN_ID | CAN_EFF_FLAG, mask,
                            NODE_CAN_ID | CAN_EFF_FLAG, mask,
                            HS_REQUEST_CAN_ID | CAN_EFF_FLAG, mask,
-                           HS_RESPONSE_CAN_ID | CAN_EFF_FLAG, mask)
+                           HS_RESPONSE_CAN_ID | CAN_EFF_FLAG, mask,
+                           ESTOP_CAN_ID | CAN_EFF_FLAG, mask)
 
     def _run(self):
         try:
@@ -612,6 +653,8 @@ class SpecterReader:
                     self.hs_request.ingest(time.time(), data)
                 elif cid == HS_RESPONSE_CAN_ID:
                     self.hs_response.ingest(time.time(), data)
+                elif cid == ESTOP_CAN_ID:
+                    self.estop.ingest(time.time(), data)
         except OSError as e:
             self.error = f"{self.iface}: {e.strerror or e}"
         finally:
