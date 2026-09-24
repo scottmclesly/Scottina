@@ -199,16 +199,18 @@ GROUP_KEYS = ["g1", "g2", "g3", "g4", "g5", "g6", "g7"]
 GROUP_LETTERS = ["S", "P", "E1", "C", "T", "E2", "R"]
 
 # Each group covers a fixed set of step indices. The seven sets partition
-# 0 to 12 exactly once, so every step belongs to one group and no step
-# belongs to two. The rollup rule is display-side and is not on the wire.
+# 0 to 11 exactly once, so every step belongs to one group and no step
+# belongs to two. POWER ACC MODE WAS REMOVED from the checklist on
+# 2026-09-24 and every step after it moved down one, which is why the
+# checklist id is 0x0002. The rollup rule is display-side and is not on the wire.
 GROUP_STEPS = {
     1: (1, 2, 3),
     2: (4,),
-    3: (0, 6, 12),
-    4: (8,),
-    5: (9,),
-    6: (7,),
-    7: (5, 10, 11),
+    3: (0, 11),
+    4: (7,),
+    5: (8,),
+    6: (6,),
+    7: (5, 9, 10),
 }
 
 # The shore link is NOT a checklist step. It is never walked, never started
