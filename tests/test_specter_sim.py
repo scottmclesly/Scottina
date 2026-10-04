@@ -373,5 +373,120 @@ class TestTheSeakeeperRide(SimTestCase):
             specter_sim.RIDE = saved
 
 
+@unittest.skipIf(CODEC, CODEC or "")
+class TestTheEngine(unittest.TestCase):
+    """Step 10 and 11. The display commands the engine on 0x0405 and reads
+    RUNNING from a live 0x1800. The rig must answer both, and must never
+    send an rpm the engine did not earn."""
+
+    def setUp(self):
+        self.engine = specter_sim.EngineModel()
+
+    def run_for(self, start, seconds, dt=0.05):
+        t = start
+        while t < start + seconds:
+            t += dt
+            self.engine.advance(t, dt)
+        return t
+
+    def rpm_frame(self):
+        frames = self.engine.frames()
+        if not frames:
+            return None
+        can_id, data, _label = frames[0]
+        self.assertEqual(can_id, (0x1800 << 8) | 0x82)
+        return int.from_bytes(data[0:2], "little")
+
+    def test_the_ignition_powers_the_ecu(self):
+        self.assertIsNone(self.rpm_frame(), "ignition off: nothing is sent")
+        self.engine.note_action(1, 0x20, 0.0)
+        self.assertEqual(self.rpm_frame(), 0, "ignition on: 0 rpm")
+
+    def test_engine_start_cranks_then_idles(self):
+        self.engine.note_action(1, 0x20, 0.0)
+        self.engine.note_action(3, 0x20, 1.0)
+        self.engine.advance(1.05, 0.05)
+        self.assertEqual(self.rpm_frame(), int(specter_sim.ENGINE_CRANK_RPM))
+        t = self.run_for(1.05, 3.0)
+        self.assertEqual(self.engine.report()["phase"], "running")
+        self.assertEqual(self.rpm_frame(), int(specter_sim.ENGINE_IDLE_RPM))
+        self.engine.note_action(4, 0x20, t)
+        self.run_for(t, 2.0)
+        self.assertEqual(self.rpm_frame(), 0, "Engine Off: back to 0 rpm")
+        self.engine.note_action(2, 0x20, t + 2.0)
+        self.assertIsNone(self.rpm_frame(), "Ignition Off: silent again")
+
+    def test_a_start_without_ignition_is_refused(self):
+        note = self.engine.note_action(3, 0x20, 0.0)
+        self.assertIn("REFUSED", note)
+        self.run_for(0.0, 2.0)
+        self.assertEqual(self.engine.report()["phase"], "off")
+
+    def test_every_frame_is_one_action(self):
+        for _ in range(3):
+            self.engine.note_action(1, 0x20, 0.0)
+        self.assertEqual(self.engine.report()["actions"], 3)
+
+    def test_an_unknown_action_is_refused(self):
+        self.assertIn("REFUSED", self.engine.note_action(5, 0x20, 0.0))
+        self.assertEqual(self.engine.report()["refused"], 1)
+
+    def test_nostart_cranks_and_never_catches(self):
+        self.engine.set_no_start(True)
+        self.engine.note_action(1, 0x20, 0.0)
+        self.engine.note_action(3, 0x20, 0.0)
+        self.run_for(0.0, 2.0)
+        r = self.engine.report()
+        self.assertEqual(r["phase"], "cranking")
+        self.assertEqual(self.rpm_frame(), int(specter_sim.ENGINE_CRANK_RPM))
+        self.run_for(2.0, specter_sim.ENGINE_STARTER_LIMIT_S)
+        self.assertEqual(self.engine.report()["phase"], "off")
+
+    def test_freeze_stops_the_rpm(self):
+        self.engine.note_action(1, 0x20, 0.0)
+        self.engine.freeze(True)
+        self.assertIsNone(self.rpm_frame())
+
+    def test_the_synthetic_rpm_row_is_gone(self):
+        tids = [row[0] for row in specter_sim.TELEMETRY_TABLE]
+        self.assertNotIn(0x1800, tids,
+                         "a free-running rpm makes every start look good")
+
+
+@unittest.skipIf(CODEC, CODEC or "")
+class TestTheVentilationRelays(unittest.TestCase):
+    """Step 5. The display switches bank 3 relay 8, both blowers, and relay
+    6, both bilge pumps, with 0x0800."""
+
+    def setUp(self):
+        self.relays = specter_sim.RelayModel()
+
+    def states(self):
+        _can_id, data, _label = self.relays.frames()[0]
+        self.assertEqual(data[0], 3, "bank 3")
+        self.assertEqual(data[1], 3, "the six states start at relay 3")
+        return list(data[2:8])
+
+    def test_the_relays_report_what_was_commanded(self):
+        self.assertEqual(self.states(), [0] * 6)
+        self.assertIn("both blowers",
+                      self.relays.note_command(3, 8, 1, 0x20, 0.0))
+        self.assertEqual(self.states(), [0, 0, 0, 0, 0, 1], "relay 8 On")
+        self.relays.note_command(3, 8, 0, 0x20, 2.0)
+        self.relays.note_command(3, 6, 1, 0x20, 2.0)
+        self.assertEqual(self.states(), [0, 0, 0, 1, 0, 0], "relay 6 On")
+        self.relays.note_command(3, 6, 0, 0x20, 4.0)
+        self.assertEqual(self.states(), [0] * 6)
+
+    def test_a_bad_state_is_refused(self):
+        self.assertIn("REFUSED", self.relays.note_command(3, 8, 7, 0x20, 0.0))
+        self.assertEqual(self.states(), [0] * 6)
+
+    def test_other_banks_are_kept_but_not_in_the_bank_3_frame(self):
+        self.relays.note_command(2, 1, 1, 0x20, 0.0)
+        self.assertEqual(self.relays.state_of(2, 1), 1)
+        self.assertEqual(self.states(), [0] * 6)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -400,6 +400,63 @@ TID_TRIM_FEEDBACK = 0x1801
 #: The rig answers as the engine does, the Yanmar ToCAN device.
 TRIM_FEEDBACK_SOURCE = YANMAR_SOURCE
 
+#: `0x0405 Engine Action Command`, from the DISPLAY at source 0x20.
+#:
+#: ONE FRAME IS ONE ACTION. Ben: "if one message is sent, one action is
+#: performed. If two messages are sent, two actions are performed." So the
+#: rig acts on EVERY frame it hears, and it never reads a repeat as a
+#: duplicate. spec byte 1 is data[0], the action.
+TID_ENGINE_ACTION = 0x0405
+
+#: Ben's action values. They are the wire values.
+ENGINE_ACTION_IGNITION_ON = 1
+ENGINE_ACTION_IGNITION_OFF = 2
+ENGINE_ACTION_ENGINE_START = 3
+ENGINE_ACTION_ENGINE_OFF = 4
+ENGINE_ACTION_NAMES = {
+    ENGINE_ACTION_IGNITION_ON: "Ignition On",
+    ENGINE_ACTION_IGNITION_OFF: "Ignition Off",
+    ENGINE_ACTION_ENGINE_START: "Engine Start",
+    ENGINE_ACTION_ENGINE_OFF: "Engine Off",
+}
+
+#: `0x1800 Engine RPM`. 10 Hz, from the engine. `EngineModel` owns it now.
+TID_ENGINE_RPM = 0x1800
+
+#: The modelled start. BENCH NUMBERS, NOT A MEASURED ENGINE. The starter
+#: turns the engine at CRANK rpm for CRANK seconds, then it catches and
+#: rises to IDLE at RAMP rpm per second.
+ENGINE_CRANK_RPM = 250.0
+ENGINE_CRANK_S = 0.8
+ENGINE_IDLE_RPM = 800.0
+ENGINE_RAMP_RPM_PER_S = 1500.0
+ENGINE_STOP_RPM_PER_S = 1200.0
+
+#: How long the starter turns an engine that will not catch, before the
+#: starter itself gives up. Only `engine nostart` reaches it.
+ENGINE_STARTER_LIMIT_S = 10.0
+
+#: `0x0800 Relay Set`, from the DISPLAY at source 0x20. spec byte 1 is the
+#: bank, spec byte 2 the relay, spec byte 3 the state: 0 Off, 1 On, 2 Auto.
+#: The bank is a plain id, the same reading the display makes.
+TID_RELAY_SET = 0x0800
+
+#: Ben, 2026-10-04. The two blowers are wired in parallel on one relay, and
+#: so are the two bilge pumps.
+VENT_RELAY_BANK = 3
+VENT_BLOWER_RELAY = 8
+VENT_PUMP_RELAY = 6
+
+#: The `0x1400` frame for bank 3 starts at this relay, so its six states
+#: cover relays 3 to 8, which holds both ventilation relays.
+VENT_RELAY_FEEDBACK_FIRST = 3
+
+RELAY_NAMES = {
+    (VENT_RELAY_BANK, VENT_BLOWER_RELAY): "both blowers",
+    (VENT_RELAY_BANK, VENT_PUMP_RELAY): "both bilge pumps",
+}
+RELAY_STATE_NAMES = {0: "Off", 1: "On", 2: "Auto"}
+
 #: How fast the modelled trim ram travels, in degrees per second.
 #:
 #: A SWEEP MUST TAKE REAL TIME. The display's sweep is nominal 30 to 40 and
@@ -589,8 +646,13 @@ TELEMETRY_TABLE = (
      'fuel level %'),                       # 55 to 75 %
     (0x1805, YANMAR_SOURCE, 'potential',             14.40,  0.50, 1.0,
      'alternator potential V'),             # 13.90 to 14.90 V
-    (0x1800, YANMAR_SOURCE, 'rpm',                 1200.0, 400.0,  0.1,
-     'engine rpm'),                         # 800 to 1600 rpm
+    # 0x1800 IS NOT HERE ANY MORE. IT IS A MODELLED ENGINE NOW, 2026-10-04.
+    #
+    # It was a free-running sine, 800 to 1600 rpm, all the time. The display
+    # now STARTS the engine with 0x0405 and reads RUNNING from a live 0x1800
+    # one second later, so a sine would make every start look good, even one
+    # the engine never answered. `EngineModel` owns 0x1800, and
+    # `engine_worker` sends it at the same 10 Hz this row did.
     # 0x1801 IS NOT HERE ANY MORE. IT IS A MODELLED DEVICE NOW.
     #
     # It used to be a free-running sine, 0 to 8 degrees, like every other row
@@ -685,6 +747,8 @@ RUDDER = None
 ACTUATORS = None
 TRIM = None
 RIDE = None
+ENGINE = None
+RELAYS = None
 
 
 def say(text):
@@ -1924,6 +1988,215 @@ class TrimModel:
                  "engine tilt/trim %d deg" % value)]
 
 
+class EngineModel:
+    """An engine that answers 0x0405 and reports 0x1800 rpm.
+
+    THE ECU IS POWERED BY THE IGNITION. With the ignition off it sends
+    NOTHING, as an unpowered engine controller does, so the display reads NO
+    DATA. With the ignition on and the engine stopped it sends 0 rpm.
+
+    ENGINE START CRANKS, THEN CATCHES. The starter turns it at
+    `ENGINE_CRANK_RPM` for `ENGINE_CRANK_S`, then it rises to idle.
+    `engine nostart` makes it crank and never catch, which is the test of
+    the display's running threshold: a cranking engine also turns.
+
+    THE RPM IS THE ONLY OUTPUT. This class does not know what step 10 is.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.ignition = False
+        self.phase = "off"           # off, cranking, running
+        self.rpm = 0.0
+        self.crank_at = None
+        self.frozen = False          # the bench can stop 0x1800
+        self.no_start = False        # the bench can make it fail to catch
+        self.actions = 0
+        self.refused = 0
+        self.last_action = None
+        self.last_source = None
+        self.last_note = ""
+
+    def note_action(self, action, source, now):
+        """One 0x0405 arrived. EVERY frame is one action. Return a note."""
+        with self.lock:
+            self.actions += 1
+            self.last_action = action
+            self.last_source = source
+            name = ENGINE_ACTION_NAMES.get(action)
+            if name is None:
+                self.refused += 1
+                note = "REFUSED: action %d is not in Ben's list" % action
+            elif action == ENGINE_ACTION_IGNITION_ON:
+                self.ignition = True
+                note = "ignition on"
+            elif action == ENGINE_ACTION_IGNITION_OFF:
+                # The ignition cuts the engine too, as a key switch does.
+                self.ignition = False
+                self.phase = "off"
+                note = "ignition off, the engine stops"
+            elif action == ENGINE_ACTION_ENGINE_START:
+                if not self.ignition:
+                    # REFUSED, NOT IGNORED QUIETLY. A start with no ignition
+                    # turns nothing on a real engine either, and the display
+                    # must then never read RUNNING.
+                    self.refused += 1
+                    note = "REFUSED: the ignition is off"
+                elif self.phase != "off":
+                    note = "already %s" % self.phase
+                else:
+                    self.phase = "cranking"
+                    self.crank_at = now
+                    note = ("cranking, and it will NOT catch"
+                            if self.no_start else "cranking")
+            else:
+                self.phase = "off"
+                note = "engine off"
+            self.last_note = note
+            return "%s: %s" % (name or "action %d" % action, note)
+
+    def advance(self, now, dt):
+        """Move the rpm. Return it."""
+        with self.lock:
+            if self.phase == "cranking":
+                start = now if self.crank_at is None else self.crank_at
+                elapsed = now - start
+                if self.no_start and elapsed >= ENGINE_STARTER_LIMIT_S:
+                    self.phase = "off"
+                elif not self.no_start and elapsed >= ENGINE_CRANK_S:
+                    self.phase = "running"
+                else:
+                    self.rpm = ENGINE_CRANK_RPM
+            if self.phase == "running":
+                self.rpm = min(ENGINE_IDLE_RPM,
+                               self.rpm + ENGINE_RAMP_RPM_PER_S * dt)
+            elif self.phase == "off":
+                self.rpm = max(0.0, self.rpm - ENGINE_STOP_RPM_PER_S * dt)
+            return self.rpm
+
+    def report(self):
+        with self.lock:
+            return {"ignition": self.ignition, "phase": self.phase,
+                    "rpm": self.rpm, "frozen": self.frozen,
+                    "no_start": self.no_start, "actions": self.actions,
+                    "refused": self.refused,
+                    "last_action": self.last_action,
+                    "last_source": self.last_source,
+                    "last_note": self.last_note}
+
+    def freeze(self, on):
+        """Stop sending 0x1800, or send it again.
+
+        THE NEGATIVE TEST: with no rpm the display must never read RUNNING,
+        and its footer must stay on ABORT.
+        """
+        with self.lock:
+            self.frozen = bool(on)
+
+    def set_no_start(self, on):
+        with self.lock:
+            self.no_start = bool(on)
+
+    def frames(self):
+        """The 0x1800 frame, or nothing with the ignition off or frozen."""
+        with self.lock:
+            if self.frozen or not self.ignition:
+                return []
+            rpm = int(round(self.rpm))
+        data = encode_physical(TID_ENGINE_RPM, rpm=float(rpm))
+        return [(((TID_ENGINE_RPM << 8) | YANMAR_SOURCE), data,
+                 "engine rpm %d" % rpm)]
+
+
+def engine_worker(sock, tx_lock, engine, stop_event):
+    """Run the modelled engine and report 0x1800 at 10 Hz."""
+    period = TELEMETRY_FAST_PERIOD_S
+    last = time.monotonic()
+    while not stop_event.is_set():
+        now = time.monotonic()
+        engine.advance(now, now - last)
+        last = now
+        for can_id, data, _label in engine.frames():
+            try:
+                with tx_lock:
+                    send_frame(sock, can_id, data)
+            except OSError:
+                pass
+        stop_event.wait(period)
+
+
+class RelayModel:
+    """The relay bank the display switches with 0x0800, reported on 0x1400.
+
+    A RELAY DOES WHAT IT IS TOLD. It has no travel time. The model exists so
+    the bench can SEE what the display commanded, and so bank 3 reports it
+    back on `0x1400` the way the switching module would.
+
+    THE DISPLAY READS NO 0x1400 FOR THE VENTILATION. `0x0800` has no
+    feedback in Ben's list, so the glass draws what the display SENT. This
+    frame is for the bench and for stage 2, never a test the display passes.
+    """
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.states = {}             # (bank, relay) -> 0, 1 or 2
+        self.commands = 0
+        self.refused = 0
+        self.last = None
+
+    def note_command(self, bank, relay, state, source, now):
+        """One 0x0800 arrived. Return a note for the log."""
+        name = RELAY_NAMES.get((bank, relay), "")
+        label = "bank %d relay %d%s" % (bank, relay,
+                                        " (%s)" % name if name else "")
+        with self.lock:
+            self.commands += 1
+            if state not in RELAY_STATE_NAMES:
+                self.refused += 1
+                self.last = (bank, relay, state, source, now)
+                return "%s: REFUSED, state %d is not Off, On or Auto" % (
+                    label, state)
+            self.states[(bank, relay)] = state
+            self.last = (bank, relay, state, source, now)
+        return "%s: %s" % (label, RELAY_STATE_NAMES[state])
+
+    def state_of(self, bank, relay):
+        with self.lock:
+            return self.states.get((bank, relay), 0)
+
+    def report(self):
+        with self.lock:
+            return {"states": dict(self.states), "commands": self.commands,
+                    "refused": self.refused, "last": self.last}
+
+    def frames(self):
+        """One 0x1400 frame for bank 3, relays 3 to 8."""
+        fields = {"bank_id": VENT_RELAY_BANK,
+                  "initial_relay_id": VENT_RELAY_FEEDBACK_FIRST}
+        with self.lock:
+            for index in range(6):
+                relay = VENT_RELAY_FEEDBACK_FIRST + index
+                fields["relay_state_%d" % index] = self.states.get(
+                    (VENT_RELAY_BANK, relay), 0)
+        data = encode_raw(TID_RELAY_STATE, **fields)
+        return [(((TID_RELAY_STATE << 8) | SWITCHING_SOURCE), data,
+                 "relay bank %d, relays %d to %d" % (
+                     VENT_RELAY_BANK, VENT_RELAY_FEEDBACK_FIRST,
+                     VENT_RELAY_FEEDBACK_FIRST + 5))]
+
+
+def relay_worker(sock, tx_lock, relays, stop_event):
+    """Report bank 3 on 0x1400 at 1 Hz, the rate Ben gives it."""
+    while not stop_event.is_set():
+        for can_id, data, _label in relays.frames():
+            try:
+                with tx_lock:
+                    send_frame(sock, can_id, data)
+            except OSError:
+                pass
+        stop_event.wait(TELEMETRY_PERIOD_S)
+
+
 def trim_worker(sock, tx_lock, trim, stop_event):
     """Move the modelled trim ram and report it at 1 Hz.
 
@@ -2203,6 +2476,8 @@ def open_monitor_socket(interface):
     watched.append((TID_RUDDER_COMMAND << 8) | DISPLAY_SOURCE)
     watched.append((TID_ACTUATOR_COMMAND << 8) | DISPLAY_SOURCE)
     watched.append((TID_TRIM_COMMAND << 8) | DISPLAY_SOURCE)
+    watched.append((TID_ENGINE_ACTION << 8) | DISPLAY_SOURCE)
+    watched.append((TID_RELAY_SET << 8) | DISPLAY_SOURCE)
     can_filters = b"".join(
         struct.pack("=II", can_id | CAN_EFF_FLAG, mask)
         for can_id in watched)
@@ -2213,7 +2488,7 @@ def open_monitor_socket(interface):
 
 
 def system_test_monitor(sock, state, stop_event, rudder=None,
-                        actuators=None, trim=None):
+                        actuators=None, trim=None, engine=None, relays=None):
     """Feed the node's system test from the frames actually on the bus.
 
     It notes evidence whether or not a test is running. `SpecterSystemTest`
@@ -2254,6 +2529,21 @@ def system_test_monitor(sock, state, stop_event, rudder=None,
             # The model reads it unsigned because the document says unsigned.
             if trim is not None and dlc >= 1:
                 trim.note_command(payload[0], source, now)
+            continue
+
+        if tid == TID_ENGINE_ACTION:
+            # spec byte 1 is data[0], the action. EVERY frame is one action.
+            if engine is not None and dlc >= 1:
+                say("0x0405 from 0x%02X  %s"
+                    % (source, engine.note_action(payload[0], source, now)))
+            continue
+
+        if tid == TID_RELAY_SET:
+            # spec bytes 1 to 3 are data[0] to data[2]: bank, relay, state.
+            if relays is not None and dlc >= 3:
+                say("0x0800 from 0x%02X  %s"
+                    % (source, relays.note_command(
+                        payload[0], payload[1], payload[2], source, now)))
             continue
 
         if tid == TID_HEARTBEAT:
@@ -2559,6 +2849,10 @@ HELP_TEXT = "\n".join([
     "  trim freeze|thaw  stop or restart 0x1801. THE NEGATIVE TEST",
     "  trim up|down|centre|set <deg>   place the leg. IT REACHES BELOW ZERO,",
     "                    which the display can DRAW and can never COMMAND",
+    "  engine            show the modelled engine, 0x0405 in, 0x1800 out",
+    "  engine freeze|thaw  stop or restart 0x1800. THE NEGATIVE TEST",
+    "  engine nostart|normal  crank and never catch, or start normally",
+    "  relays            show what the display switched on 0x0800",
     "  ride              show the SIMULATED Seakeeper Ride, step 3",
     "                    0x2402 intent in, 0x2482 measured position out",
     "  ride freeze|thaw  stop or restart 0x2482. THE NODE IS GONE",
@@ -2918,6 +3212,67 @@ def handle_command(state, stop_event, line):
             ]))
         return
 
+    if head == "engine":
+        want = parts[1].lower() if len(parts) > 1 else "show"
+        if want == "freeze":
+            ENGINE.freeze(True)
+            say("Engine rpm 0x1800 STOPPED. The display must NOT read "
+                "RUNNING.")
+        elif want in ("thaw", "restore"):
+            ENGINE.freeze(False)
+            say("Engine rpm 0x1800 is sent again, while the ignition is on.")
+        elif want in ("nostart", "fail"):
+            ENGINE.set_no_start(True)
+            say("The next Engine Start cranks at %.0f rpm and never catches. "
+                "The starter gives up after %.0f s." % (
+                    ENGINE_CRANK_RPM, ENGINE_STARTER_LIMIT_S))
+        elif want in ("normal", "start"):
+            ENGINE.set_no_start(False)
+            say("The engine catches after %.1f s of cranking." %
+                ENGINE_CRANK_S)
+        else:
+            r = ENGINE.report()
+            last = ("none" if r["last_action"] is None else
+                    "%s from source 0x%02X, %s" % (
+                        ENGINE_ACTION_NAMES.get(
+                            r["last_action"], "action %d" % r["last_action"]),
+                        r["last_source"], r["last_note"]))
+            say("\n".join([
+                "-" * 66,
+                "The modelled engine. 0x0405 in, 0x1800 out at 10 Hz.",
+                "  ignition        : %s" % ("ON" if r["ignition"] else "off"),
+                "  engine          : %s%s" % (
+                    r["phase"], "   (will not catch)" if r["no_start"]
+                    else ""),
+                "  measured 0x1800 : %s" % (
+                    "NOT SENT, frozen" if r["frozen"] else
+                    "NOT SENT, the ignition is off" if not r["ignition"]
+                    else "%.0f rpm" % r["rpm"]),
+                "  last 0x0405     : %s" % last,
+                "  actions heard   : %d, refused %d" % (
+                    r["actions"], r["refused"]),
+                "  NOTE: bench numbers. Crank %.0f rpm for %.1f s, idle "
+                "%.0f rpm." % (ENGINE_CRANK_RPM, ENGINE_CRANK_S,
+                               ENGINE_IDLE_RPM),
+            ]))
+        return
+
+    if head == "relays":
+        r = RELAYS.report()
+        lines = ["-" * 66,
+                 "The relays the display switched with 0x0800. Bank %d is "
+                 "reported on 0x1400." % VENT_RELAY_BANK]
+        if not r["states"]:
+            lines.append("  nothing commanded yet")
+        for (bank, relay), value in sorted(r["states"].items()):
+            name = RELAY_NAMES.get((bank, relay), "")
+            lines.append("  bank %d relay %d  %-4s %s" % (
+                bank, relay, RELAY_STATE_NAMES.get(value, value), name))
+        lines.append("  commands heard  : %d, refused %d" % (
+            r["commands"], r["refused"]))
+        say("\n".join(lines))
+        return
+
     if head == "trim":
         want = parts[1].lower() if len(parts) > 1 else "show"
         if want == "freeze":
@@ -3235,12 +3590,15 @@ def main():
         "drop_status_after": args.drop_status_after,
     }
 
-    global TELEMETRY, SYSTEM_TEST, RUDDER, ACTUATORS, TRIM, RIDE
+    global TELEMETRY, SYSTEM_TEST, RUDDER, ACTUATORS, TRIM, RIDE, ENGINE
+    global RELAYS
     SYSTEM_TEST = SystemTestEmulator()
     RUDDER = RudderModel()
     ACTUATORS = ActuatorModel()
     TRIM = TrimModel()
     RIDE = RideSimModel()
+    ENGINE = EngineModel()
+    RELAYS = RelayModel()
     TELEMETRY = TelemetryState(fuel_percent=args.fuel,
                                volts=args.volts,
                                wiggle=not args.no_wiggle)
@@ -3309,7 +3667,8 @@ def main():
     monitor_sock = open_monitor_socket(args.interface)
     monitor_thread = threading.Thread(
         target=system_test_monitor,
-        args=(monitor_sock, state, stop_event, RUDDER, ACTUATORS, TRIM),
+        args=(monitor_sock, state, stop_event, RUDDER, ACTUATORS, TRIM,
+              ENGINE, RELAYS),
         name="system-test-monitor", daemon=True)
     rudder_thread = threading.Thread(
         target=rudder_worker,
@@ -3323,6 +3682,14 @@ def main():
         target=trim_worker,
         args=(tx_sock, tx_lock, TRIM, stop_event),
         name="trim", daemon=True)
+    engine_thread = threading.Thread(
+        target=engine_worker,
+        args=(tx_sock, tx_lock, ENGINE, stop_event),
+        name="engine", daemon=True)
+    relay_thread = threading.Thread(
+        target=relay_worker,
+        args=(tx_sock, tx_lock, RELAYS, stop_event),
+        name="relays", daemon=True)
     ride_thread = threading.Thread(
         target=ride_worker,
         args=(tx_sock, tx_lock, state, RIDE, stop_event),
@@ -3337,6 +3704,8 @@ def main():
     rudder_thread.start()
     actuator_thread.start()
     trim_thread.start()
+    engine_thread.start()
+    relay_thread.start()
     ride_thread.start()
 
     if args.duration > 0:
