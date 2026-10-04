@@ -343,6 +343,33 @@ class TestTheSeakeeperRide(SimTestCase):
         self.assertFalse(self.flag(),
                          "step 5 was begun since. The Ride no longer answers")
 
+    def test_ride_node_hands_step_3_to_the_real_node(self):
+        """The real node owns the Ride transport. With `ride node` set, this
+        rig must not be a second node on step 3."""
+        stop = specter_sim.threading.Event()
+        specter_sim.handle_command(self.state, stop, "ride node")
+        self.assertFalse(self.state.ride_sim)
+        self.state._run_event(event(SpecterEventType.STEP_BEGIN,
+                                    step=self.RIDE, sequence=1))
+        self.state._run_event(event(SpecterEventType.ACTUATE_UP,
+                                    step=self.RIDE,
+                                    param=int(SpecterActuateTarget.PORT),
+                                    sequence=2))
+        self.assertFalse(self.state.ride.port_moving,
+                         "THE RIG DROVE A RIDE THE REAL NODE OWNS")
+        self.assertTrue(any("IGNORED" in line for line in self.said))
+        self.assertFalse(self.state.ride_began,
+                         "the Ride's operator flag is not the rig's to set")
+
+        specter_sim.handle_command(self.state, stop, "ride sim")
+        self.assertTrue(self.state.ride_sim)
+        self.state._run_event(event(SpecterEventType.ACTUATE_UP,
+                                    step=self.RIDE,
+                                    param=int(SpecterActuateTarget.PORT),
+                                    sequence=3))
+        self.assertTrue(self.state.ride.port_moving,
+                        "`ride sim` gives step 3 back to the rig")
+
     def test_the_console_negative_tests(self):
         stop = specter_sim.threading.Event()
         saved = specter_sim.RIDE
@@ -442,6 +469,32 @@ class TestTheEngine(unittest.TestCase):
         self.run_for(2.0, specter_sim.ENGINE_STARTER_LIMIT_S)
         self.assertEqual(self.engine.report()["phase"], "off")
 
+    def test_fail_gives_no_rpm_at_all(self):
+        """`engine fail`: Engine Start turns nothing, so 0x1800 reads 0 and
+        the display must never read RUNNING."""
+        self.engine.set_fail(True)
+        self.engine.note_action(1, 0x20, 0.0)
+        note = self.engine.note_action(3, 0x20, 0.0)
+        self.assertIn("FAILED", note)
+        self.run_for(0.0, 3.0)
+        self.assertEqual(self.engine.report()["phase"], "off")
+        self.assertEqual(self.rpm_frame(), 0,
+                         "the ECU is powered and reports 0 rpm")
+        self.engine.set_fail(False)
+        self.engine.note_action(3, 0x20, 3.0)
+        self.run_for(3.0, 1.0)
+        self.assertGreater(self.rpm_frame(), 0,
+                           "with `engine ok` the next start gives a live rpm "
+                           "within one second")
+
+    def test_engine_off_drops_the_rpm_to_zero(self):
+        self.engine.note_action(1, 0x20, 0.0)
+        self.engine.note_action(3, 0x20, 0.0)
+        t = self.run_for(0.0, 3.0)
+        self.engine.note_action(4, 0x20, t)
+        self.run_for(t, 2.0)
+        self.assertEqual(self.rpm_frame(), 0)
+
     def test_freeze_stops_the_rpm(self):
         self.engine.note_action(1, 0x20, 0.0)
         self.engine.freeze(True)
@@ -486,6 +539,58 @@ class TestTheVentilationRelays(unittest.TestCase):
         self.relays.note_command(2, 1, 1, 0x20, 0.0)
         self.assertEqual(self.relays.state_of(2, 1), 1)
         self.assertEqual(self.states(), [0] * 6)
+
+
+@unittest.skipIf(CODEC, CODEC or "")
+class TestTheTrim(unittest.TestCase):
+    """Step 2. The display sweeps 0 -> -20 -> 0 on 0x0403, now SIGNED, and
+    reads 0x1801. The rig moves in Ben's range, -20 to +20, rests at 0, and
+    REFUSES a command outside it."""
+
+    def setUp(self):
+        self.trim = specter_sim.TrimModel()
+
+    def measured(self):
+        frames = self.trim.frames()
+        raw = frames[0][1][0]
+        return raw - 256 if raw > 127 else raw
+
+    def run_for(self, start, seconds, dt=0.05):
+        t = start
+        while t < start + seconds:
+            t += dt
+            self.trim.advance(t, dt)
+        return t
+
+    def test_it_rests_at_zero(self):
+        self.assertEqual(self.measured(), 0)
+
+    def test_a_signed_command_is_read_as_signed(self):
+        t = 0.0
+        for _ in range(200):
+            self.trim.note_command(0xEC, 0x20, t)
+            t = self.run_for(t, 0.1)
+        self.assertEqual(self.measured(), -20,
+                         "0xEC IS -20, not 236 degrees")
+
+    def test_it_travels_at_three_degrees_per_second(self):
+        self.trim.note_command(0xEC, 0x20, 0.0)
+        self.run_for(0.0, 0.4)
+        self.trim.note_command(0xEC, 0x20, 0.4)
+        self.run_for(0.4, 0.6)
+        self.assertEqual(self.measured(), -3)
+
+    def test_a_command_outside_the_range_is_refused_not_clamped(self):
+        for raw in (21, 30, 40, 0xEB, 0x80):
+            self.trim.note_command(raw, 0x20, 0.0)
+            self.assertIsNone(self.trim.report()["command"],
+                              "%d WAS ACCEPTED. It must be refused" % raw)
+        self.trim.note_command(20, 0x20, 0.0)
+        self.assertEqual(self.trim.report()["command"], 20.0,
+                         "+20 is inside Ben's range")
+        self.assertEqual((specter_sim.TRIM_MIN_DEG, specter_sim.TRIM_MAX_DEG),
+                         (-20.0, 20.0))
+        self.assertEqual(specter_sim.TRIM_NOMINAL_DEG, 0.0)
 
 
 if __name__ == "__main__":

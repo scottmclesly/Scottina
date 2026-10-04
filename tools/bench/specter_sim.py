@@ -385,8 +385,13 @@ RUDDER_COMMAND_HOLD_S = 0.5
 #: obeys whichever it saw last and says which one it was, exactly as it does
 #: for the rudder.
 #:
-#: spec byte 1 is the angle, ONE UNSIGNED BYTE, one degree per bit. spec
-#: byte 2 bit 0 is the Trim/Tilt Override, which the display leaves off.
+#: spec byte 1 is the angle, ONE SIGNED BYTE, two's complement, one degree
+#: per bit. -20 arrives as 0xEC. spec byte 2 bit 0 is the Trim/Tilt
+#: Override, which the display leaves off.
+#:
+#: SIGNED SINCE 2026-10-04. Ben's trim range is -20 to +20 degrees, and a -20
+#: degree command cannot exist in an unsigned byte. TID_SPECIFICATION.md
+#: still says unsigned; the update is Ben's.
 TID_TRIM_COMMAND = 0x0403
 
 #: `0x1801 Engine Tilt/Trim`. The MEASURED angle, 1 Hz, ONE SIGNED BYTE.
@@ -459,10 +464,10 @@ RELAY_STATE_NAMES = {0: "Off", 1: "On", 2: "Auto"}
 
 #: How fast the modelled trim ram travels, in degrees per second.
 #:
-#: A SWEEP MUST TAKE REAL TIME. The display's sweep is nominal 30 to 40 and
-#: back, which is 20 degrees of travel. At 3 degrees per second that is
-#: about seven seconds, and the operator can watch the number climb and
-#: come back. A rig that jumped the feedback to the commanded value would
+#: A SWEEP MUST TAKE REAL TIME. The display's sweep is 0 to -20 and back,
+#: which is 40 degrees of travel. At 3 degrees per second that is about
+#: thirteen seconds, and the operator can watch the number go out and come
+#: back. A rig that jumped the feedback to the commanded value would
 #: let the display finish a sweep in one slice, and every rule about
 #: watching the metal move would be untested.
 #:
@@ -484,35 +489,23 @@ TRIM_COMMAND_HOLD_S = 0.5
 
 #: Where the modelled leg can physically go, in degrees.
 #:
-#: **THIS IS THE TRAVEL SCOTT SPECIFIED, 2026-09-09: -10 AT THE BOTTOM AND
-#: 40 AT THE TOP.** It is the same span the display draws, in
-#: `SPECTER_TRIM_BAR_LOW_DEG` and `SPECTER_TRIM_BAR_HIGH_DEG`, so the rig
-#: models the travel the operator is told to expect and not one of its own.
+#: **BEN'S RANGE, 2026-10-04: -20 TO +20.** +20 to 0 is the trailer test and
+#: 0 to -20 is the test in the water. The display sweeps 0 -> -20 -> 0, the
+#: test in the water, and draws the whole range.
 #:
-#: IT WAS -15 TO 90, WHICH WAS THE RIG'S OWN INVENTION. Ben's specification
-#: gives no travel and no end stop, so the rig had to stop somewhere and
-#: those were where it stopped. They were never a claim about the vessel,
-#: and the display was drawing a different span from the one the rig moved
-#: in.
+#: IT WAS -10 TO 40 UNTIL 2026-10-04, around a nominal of 30.
 #:
-#: **NOBODY HAS MEASURED THE REAL DRIVE.** Correct these at stage 2, with
-#: the display constants, against a live leg.
+#: A COMMAND OUTSIDE THIS TRAVEL IS REFUSED, NEVER CLAMPED. An older display
+#: image that still sends 30 or 40 is refused, so the leg visibly does
+#: nothing. A wrong command must never look like a good one.
 #:
-#: THE LOW END IS BELOW ZERO ON PURPOSE. 0x1801 is SIGNED, so a real drive
-#: can report a negative trim. The rig can be PLACED there by hand, which is
-#: how the bench proves the display DRAWS a reading it can never COMMAND.
-TRIM_MIN_DEG = -10.0
-TRIM_MAX_DEG = 40.0
+#: **NOBODY HAS MEASURED THE REAL DRIVE.** Check these at stage 2.
+TRIM_MIN_DEG = -20.0
+TRIM_MAX_DEG = 20.0
 
 #: Where the leg rests, in degrees. It is the display's `SPECTER_TRIM_NOMINAL`.
-#:
-#: **THE SWEEP STARTS AND ENDS HERE, AND NOTHING GOES BELOW IT.** A leg
-#: driven below 30 degrees out of the water can damage the motor, so the
-#: display commands nothing lower and the rig rests nowhere lower.
-#:
-#: IT WAS 15, WHICH WAS THE OLD NOMINAL. A rig that parked at 15 showed the
-#: leg climbing out of a position the test never uses.
-TRIM_NOMINAL_DEG = 30.0
+#: The sweep starts and ends here. It was 30 until 2026-10-04.
+TRIM_NOMINAL_DEG = 0.0
 
 #: `0x0404 Linear Actuator Control`, from the DISPLAY at source 0x20.
 #: spec byte 1 is the ACTUATOR ADDRESS, spec byte 2 the percentage extension.
@@ -896,6 +889,11 @@ class SimState:
         self.ride_began = False
         #: The negative test. True stops 0x2482 altogether: the NODE is gone.
         self.ride_frame_frozen = False
+        #: True while THIS RIG answers step 3 for the node. `ride node` sets
+        #: it False: the real SPECTER node owns the Ride transport since
+        #: 2026-10-04, so a rig that also answered would be a second node on
+        #: one step. Keep it True for display-only bench runs.
+        self.ride_sim = True
 
     def session_report(self):
         """Everything the tile shows about the session, in one lock."""
@@ -1126,9 +1124,11 @@ class SimState:
         if event == int(SpecterEventType.STEP_BEGIN) and step != 0xFF:
             # Whichever step was begun LAST owns `operator_input_requested`.
             with self.lock:
-                self.ride_began = (step == SPECTER_RIDE_STEP)
+                self.ride_began = (step == SPECTER_RIDE_STEP
+                                   and self.ride_sim)
 
-        if step == SPECTER_RIDE_STEP and event in RIDE_STEP_EVENTS:
+        if (step == SPECTER_RIDE_STEP and event in RIDE_STEP_EVENTS
+                and self.ride_sim):
             # STEP 3 IS THE NODE'S TO ACTUATE. Begin starts the sweep, 0 to
             # 100 to 0 percent on both surfaces; abort and restart stop it;
             # confirm ends the sweep and LEAVES ANY RETRACT RUNNING, because
@@ -1166,8 +1166,10 @@ class SimState:
                 # window and every seen-at time carried over from the last
                 # run, so a restart reported the OLD answer at once.
                 self.checks.begin(time.monotonic())
-            if step == HATCH_STEP:
-                self.start_hatch_cycle()
+            # STEP 4 STARTS NO CYCLE HERE ANY MORE. The display runs the
+            # cycle itself on 0x0404 and finishes it on the measured 0x1812,
+            # which `ActuatorModel` answers. The real node does not cycle the
+            # hatches, so neither does this rig.
         elif event == int(SpecterEventType.STEP_CONFIRM) and step != 0xFF:
             # A step becomes GOOD only on operator confirmation.
             self.set_step(step, GOOD)
@@ -1244,6 +1246,11 @@ class SimState:
         # intent; the bench sees the last command win, which is what the
         # operator expects when they take hold of the pad.
 
+        if step == SPECTER_RIDE_STEP and not self.ride_sim:
+            say("IGNORED: %s on step 3. `ride node` is set, so the real "
+                "node owns the Ride." % event_name(event))
+            return
+
         if step == SPECTER_RIDE_STEP:
             # THE SEAKEEPER RIDE. This used to be REFUSED: the actuate events
             # were the payload hatch's alone. Step 3 sends them now, because
@@ -1283,66 +1290,6 @@ class SimState:
         say("HATCH %s %s -> port %s, starboard %s"
             % (event_name(event), target_name(target),
                HATCH_MOTION_NAMES[port], HATCH_MOTION_NAMES[stbd]))
-
-    #: The automatic hatch cycle, in seconds. Both hatches open, hold, then
-    #: close. It is the NODE'S work: the display sends STEP_BEGIN and watches.
-    HATCH_OPEN_S = 4.0
-    HATCH_HOLD_S = 2.0
-    HATCH_CLOSE_S = 4.0
-
-    def start_hatch_cycle(self):
-        """Open both hatches, hold, then close them. STEP_BEGIN starts it.
-
-        THE DISPLAY DOES NOT DRIVE THIS. It sends STEP_BEGIN like every other
-        step and the node cycles the actuators. The operator then has the
-        d-pad for manual control, which is what the rest of that screen is
-        for.
-
-        The step is left ACTIVE at the end, not GOOD. A step becomes GOOD only
-        when the operator confirms it.
-        """
-        with self.lock:
-            running = self.hatch_cycle is not None and self.hatch_cycle.is_alive()
-        if running:
-            say("The automatic hatch cycle is already running.")
-            return
-
-        def run():
-            total = self.HATCH_OPEN_S + self.HATCH_HOLD_S + self.HATCH_CLOSE_S
-            say("AUTOMATIC HATCH CYCLE: both hatches open, hold, close. "
-                "%.0f s in total." % total)
-            with self.lock:
-                self.hatch_port = HATCH_OPENING
-                self.hatch_stbd = HATCH_OPENING
-            say("  opening both. %s" % self.hatch_text())
-            time.sleep(self.HATCH_OPEN_S)
-
-            with self.lock:
-                self.hatch_port = HATCH_STOPPED
-                self.hatch_stbd = HATCH_STOPPED
-            say("  both open, holding. %s" % self.hatch_text())
-            time.sleep(self.HATCH_HOLD_S)
-
-            with self.lock:
-                self.hatch_port = HATCH_CLOSING
-                self.hatch_stbd = HATCH_CLOSING
-            say("  closing both. %s" % self.hatch_text())
-            time.sleep(self.HATCH_CLOSE_S)
-
-            with self.lock:
-                self.hatch_port = HATCH_STOPPED
-                self.hatch_stbd = HATCH_STOPPED
-                # The node has finished its part and now waits for the
-                # operator. The step stays ACTIVE: only the operator makes it
-                # GOOD, and the d-pad stays live for manual control.
-                self.operator_input_requested = True
-            say("  cycle complete. The step stays ACTIVE and the d-pad is "
-                "live. %s" % self.hatch_text())
-
-        thread = threading.Thread(target=run, name="hatch-cycle", daemon=True)
-        with self.lock:
-            self.hatch_cycle = thread
-        thread.start()
 
     def hatch_text(self):
         """One line saying what the display last told the hatches to do."""
@@ -1914,14 +1861,11 @@ class TrimModel:
     def note_command(self, raw, source, now):
         """One 0x0403 arrived. `raw` is the byte as it came off the wire.
 
-        IT IS READ AS UNSIGNED, BECAUSE THE DOCUMENT SAYS UNSIGNED.
-        TID_SPECIFICATION.md gives 0x0403 as "1 degree per bit (unsigned)"
-        and gives 0x1801 as signed. The rig reads it exactly as written. A
-        rig that quietly read it as signed would hide the mismatch from the
-        one bench that could find it.
+        IT IS READ AS SIGNED, int8, two's complement. Ben's range is -20 to
+        +20 degrees, which an unsigned byte cannot carry. 0xEC is -20.
         """
         with self.lock:
-            value = float(raw)
+            value = float(raw - 256 if raw > 127 else raw)
             if not TRIM_MIN_DEG <= value <= TRIM_MAX_DEG:
                 # OUT OF THE MODELLED TRAVEL. The rig REFUSES it rather than
                 # clamping: a clamp would let a wrong command look like a
@@ -2011,6 +1955,7 @@ class EngineModel:
         self.crank_at = None
         self.frozen = False          # the bench can stop 0x1800
         self.no_start = False        # the bench can make it fail to catch
+        self.fail = False            # the bench can make a start give no rpm
         self.actions = 0
         self.refused = 0
         self.last_action = None
@@ -2044,6 +1989,11 @@ class EngineModel:
                     note = "REFUSED: the ignition is off"
                 elif self.phase != "off":
                     note = "already %s" % self.phase
+                elif self.fail:
+                    # `engine fail`. THE STARTER DOES NOT TURN. The ECU is
+                    # powered, so 0x1800 still reads 0, and the display must
+                    # never read RUNNING.
+                    note = "FAILED: the starter does not turn, 0 rpm"
                 else:
                     self.phase = "cranking"
                     self.crank_at = now
@@ -2078,7 +2028,8 @@ class EngineModel:
         with self.lock:
             return {"ignition": self.ignition, "phase": self.phase,
                     "rpm": self.rpm, "frozen": self.frozen,
-                    "no_start": self.no_start, "actions": self.actions,
+                    "no_start": self.no_start, "fail": self.fail,
+                    "actions": self.actions,
                     "refused": self.refused,
                     "last_action": self.last_action,
                     "last_source": self.last_source,
@@ -2096,6 +2047,10 @@ class EngineModel:
     def set_no_start(self, on):
         with self.lock:
             self.no_start = bool(on)
+
+    def set_fail(self, on):
+        with self.lock:
+            self.fail = bool(on)
 
     def frames(self):
         """The 0x1800 frame, or nothing with the ignition off or frozen."""
@@ -2257,6 +2212,11 @@ def ride_worker(sock, tx_lock, state, ride, stop_event):
     next_report = time.monotonic()
     while not stop_event.is_set():
         now = time.monotonic()
+        if not state.ride_sim:
+            # `ride node`: THE REAL NODE OWNS THE RIDE. This rig sends no
+            # 0x2482 and presses nothing, so it is not a second node.
+            stop_event.wait(RIDE_STEP_S)
+            continue
         payload, _keys = ride_turn(state, ride, int(now * 1000))
         if now >= next_report:
             next_report = now + RIDE_STATUS_PERIOD_S
@@ -2525,8 +2485,7 @@ def system_test_monitor(sock, state, stop_event, rudder=None,
             continue
 
         if tid == TID_TRIM_COMMAND:
-            # spec byte 1 is data[0]. ONE UNSIGNED BYTE, 1 degree per bit.
-            # The model reads it unsigned because the document says unsigned.
+            # spec byte 1 is data[0]. ONE SIGNED BYTE, 1 degree per bit.
             if trim is not None and dlc >= 1:
                 trim.note_command(payload[0], source, now)
             continue
@@ -2851,10 +2810,12 @@ HELP_TEXT = "\n".join([
     "                    which the display can DRAW and can never COMMAND",
     "  engine            show the modelled engine, 0x0405 in, 0x1800 out",
     "  engine freeze|thaw  stop or restart 0x1800. THE NEGATIVE TEST",
-    "  engine nostart|normal  crank and never catch, or start normally",
+    "  engine fail|ok    a Start gives NO rpm, or starts normally",
+    "  engine nostart    crank and never catch",
     "  relays            show what the display switched on 0x0800",
     "  ride              show the SIMULATED Seakeeper Ride, step 3",
     "                    0x2402 intent in, 0x2482 measured position out",
+    "  ride node|sim     the real node owns the Ride, or this rig does",
     "  ride freeze|thaw  stop or restart 0x2482. THE NODE IS GONE",
     "  ride lost|found   the Ride unreachable, 0x2482 still sent. A",
     "                    DIFFERENT fault: the node is fine, the Ride is not",
@@ -3133,7 +3094,16 @@ def handle_command(state, stop_event, line):
 
     if head == "ride":
         want = parts[1].lower() if len(parts) > 1 else "show"
-        if want == "freeze":
+        if want == "node":
+            state.ride_sim = False
+            with state.ride_lock:
+                state.ride.abort()
+            say("The REAL NODE owns the Ride. This rig sends no 0x2482 and "
+                "ignores step 3 actuate events. `ride sim` gives it back.")
+        elif want == "sim":
+            state.ride_sim = True
+            say("This rig answers step 3 again, with the simulated Ride.")
+        elif want == "freeze":
             # THE NODE IS GONE. No 0x2482 at all. The display must draw NO
             # DATA and must LET THE OPERATOR WALK: a hold nobody can end is
             # a trap, and that trap took the whole keypad down on 2026-09-09.
@@ -3221,12 +3191,19 @@ def handle_command(state, stop_event, line):
         elif want in ("thaw", "restore"):
             ENGINE.freeze(False)
             say("Engine rpm 0x1800 is sent again, while the ignition is on.")
-        elif want in ("nostart", "fail"):
+        elif want == "fail":
+            ENGINE.set_fail(True)
+            ENGINE.set_no_start(False)
+            say("The next Engine Start FAILS: no crank, 0x1800 stays at 0 "
+                "rpm. The display must stay on ABORT.")
+        elif want == "nostart":
+            ENGINE.set_fail(False)
             ENGINE.set_no_start(True)
             say("The next Engine Start cranks at %.0f rpm and never catches. "
                 "The starter gives up after %.0f s." % (
                     ENGINE_CRANK_RPM, ENGINE_STARTER_LIMIT_S))
-        elif want in ("normal", "start"):
+        elif want in ("ok", "normal", "start"):
+            ENGINE.set_fail(False)
             ENGINE.set_no_start(False)
             say("The engine catches after %.1f s of cranking." %
                 ENGINE_CRANK_S)
@@ -3291,10 +3268,10 @@ def handle_command(state, stop_event, line):
             # display can be shown a reading it would otherwise only reach
             # through a sweep that stops at its own tolerance.
             #
-            # IT REACHES BELOW ZERO, WHICH THE DISPLAY CANNOT COMMAND. 0x1801
-            # is signed and 0x0403 is not, so a negative trim is a reading
-            # the glass must DRAW and the display can never ASK FOR. This is
-            # the only way to put one in front of it.
+            # IT REACHES ABOVE ZERO, WHICH THE DISPLAY NEVER COMMANDS. The
+            # sweep is 0 to -20, so a positive trim is a reading the glass
+            # must DRAW and the display never ASKS FOR. This is the way to
+            # put one in front of it.
             if want == "up":
                 value = TRIM_MAX_DEG
             elif want == "down":
@@ -3332,8 +3309,8 @@ def handle_command(state, stop_event, line):
                    "" if r["source"] is None
                    else "   from source 0x%02X" % r["source"]),
                 "  moving          : %s" % r["moving"],
-                "  NOTE: the command is UNSIGNED and the feedback is SIGNED.",
-                "        That is Ben's document, not a choice here.",
+                "  The command and the feedback are both SIGNED. The display",
+                "  sweeps 0 -> -20 -> 0, the test in the water.",
             ]))
         return
 
